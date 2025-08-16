@@ -1,0 +1,38 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: tipbot
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg:/var/lib/postgresql/data
+  bot:
+    build: .
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATABASE_URL: ${DATABASE_URL}
+      LKY_RPC_URL: ${LKY_RPC_URL}
+      LKY_RPC_USER: ${LKY_RPC_USER}
+      LKY_RPC_PASS: ${LKY_RPC_PASS}
+      MIN_CONFIRMATIONS: ${MIN_CONFIRMATIONS:-6}
+      DEFAULT_DISPLAY_DECIMALS: ${DEFAULT_DISPLAY_DECIMALS:-8}
+    depends_on: [postgres]
+    command: ["node","dist/index.js"]
+  worker:
+    build: .
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      DATABASE_URL: ${DATABASE_URL}
+      LKY_RPC_URL: ${LKY_RPC_URL}
+      LKY_RPC_USER: ${LKY_RPC_USER}
+      LKY_RPC_PASS: ${LKY_RPC_PASS}
+      MIN_CONFIRMATIONS: ${MIN_CONFIRMATIONS:-6}
+      DEFAULT_DISPLAY_DECIMALS: ${DEFAULT_DISPLAY_DECIMALS:-8}
+    depends_on: [postgres]
+    command: ["node","dist/worker.js"]
+
+volumes:
+  pg: {}

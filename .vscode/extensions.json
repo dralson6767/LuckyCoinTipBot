@@ -1,0 +1,16 @@
+{
+  "recommendations": [
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode",
+    "ms-azuretools.vscode-docker",
+    "ms-ossdata.vscode-postgresql",
+    "redhat.vscode-yaml",
+    "mikestead.dotenv",
+    "eamodio.gitlens",
+    "usernamehw.errorlens",
+    "christian-kohler.path-intellisense",
+    "yzhang.markdown-all-in-one",
+    "EditorConfig.EditorConfig",
+    "ms-vscode-remote.remote-containers"
+  ]
+}
