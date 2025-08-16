@@ -4,15 +4,16 @@
   "type": "module",
   "private": true,
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=18.17.0"
   },
   "scripts": {
     "build": "tsc -p .",
-    "start:bot": "node dist/index.js",
-    "start:worker": "node dist/worker.js",
+    "start:bot": "node dist/src/index.js",
+    "start:worker": "node dist/src/worker.js",
     "dev:bot": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
-    "db:migrate": "tsx scripts/migrate.ts"
+    "db:migrate": "node dist/scripts/migrate.js",
+    "db:migrate:dev": "tsx scripts/migrate.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
