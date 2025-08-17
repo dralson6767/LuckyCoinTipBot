@@ -208,21 +208,15 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
+  // keep the confirmation message; only delete the original command
   const pretty = formatLky(amount, decimals);
-
   if (isGroup(ctx)) {
-    await tryDelete(ctx); // remove the raw /tip command
+    await tryDelete(ctx); // delete the user's /tip command
     const fromName = ctx.from?.username
       ? `@${ctx.from.username}`
       : ctx.from?.first_name || "Someone";
     const toName = to.username ? `@${to.username}` : `user ${to.id}`;
-
-    // Short, auto-deleting confirmation to keep chat clean
-    await ephemeralReply(
-      ctx,
-      `💸 ${fromName} → ${toName}: ${pretty} LKY`,
-      12000
-    );
+    await ctx.reply(`💸 ${fromName} tipped ${pretty} LKY to ${toName}`); // <-- persists
   } else {
     await ctx.reply(
       `Sent ${pretty} LKY to ${
