@@ -1,56 +1,86 @@
-import { query } from './db.js';
+import { query } from "./db.js";
 
-export type User = {
+type TgUser = {
   id: number;
-  tg_user_id: string;
-  username: string | null;
-  first_name: string | null;
-  last_name: string | null;
+  username?: string | null;
+  first_name?: string | null;
+  last_name?: string | null;
 };
 
-export async function ensureUser(tgUser: { id: number; username?: string; first_name?: string; last_name?: string }): Promise<User> {
-  const { id, username, first_name, last_name } = tgUser;
-  const existing = await query<User>("SELECT * FROM users WHERE tg_user_id = $1", [String(id)]);
-  if (existing.rows.length) {
-    await query("UPDATE users SET username = COALESCE($2, username), first_name = COALESCE($3, first_name), last_name = COALESCE($4, last_name) WHERE tg_user_id = $1",
-      [String(id), username ?? null, first_name ?? null, last_name ?? null]);
-    return existing.rows[0];
-  }
-  const ins = await query<User>(
-    "INSERT INTO users (tg_user_id, username, first_name, last_name) VALUES ($1,$2,$3,$4) RETURNING *",
-    [String(id), username ?? null, first_name ?? null, last_name ?? null]
+export async function ensureUser(u: TgUser) {
+  // upsert by Telegram user id
+  const res = await query<{
+    id: number;
+    tg_user_id: string;
+    username: string | null;
+  }>(
+    `
+    INSERT INTO users (tg_user_id, username, first_name)
+    VALUES ($1, $2, $3)
+    ON CONFLICT (tg_user_id) DO UPDATE
+      SET username = COALESCE(EXCLUDED.username, users.username),
+          first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+          last_seen = now()
+    RETURNING id, tg_user_id, username
+    `,
+    [String(u.id), u.username ?? null, u.first_name ?? null]
   );
-  return ins.rows[0];
+  return res.rows[0];
 }
 
-export async function findUserByUsername(username: string): Promise<User | null> {
-  const res = await query<User>("SELECT * FROM users WHERE lower(username) = lower($1)", [username]);
+export async function findUserByUsername(uname: string) {
+  const res = await query<{
+    id: number;
+    tg_user_id: string;
+    username: string | null;
+  }>(
+    `SELECT id, tg_user_id, username FROM users WHERE lower(username) = lower($1) LIMIT 1`,
+    [uname]
+  );
   return res.rows[0] ?? null;
 }
 
 export async function balanceLites(userId: number): Promise<bigint> {
-  const res = await query<{ sum: string }>("SELECT COALESCE(SUM(delta_lites),0)::bigint AS sum FROM ledger WHERE user_id = $1", [userId]);
-  const s = (res.rows[0]?.sum ?? "0");
-  return BigInt(s);
+  const res = await query<{ bal: string }>(
+    `SELECT COALESCE(SUM(delta_lites::bigint), 0) AS bal FROM ledger WHERE user_id = $1`,
+    [userId]
+  );
+  return BigInt(res.rows[0].bal ?? "0");
 }
 
-export async function credit(userId: number, amountLites: bigint, reason: string, ref: string | null = null) {
-  await query("INSERT INTO ledger (user_id, delta_lites, reason, ref) VALUES ($1,$2,$3,$4)",
-    [userId, String(amountLites), reason, ref]);
-}
+// Atomic internal transfer: from -> to
+export async function transfer(fromId: number, toId: number, amount: bigint) {
+  if (amount <= 0n) throw new Error("amount must be > 0");
 
-export async function transfer(fromUserId: number, toUserId: number, amountLites: bigint): Promise<void> {
-  const bal = await balanceLites(fromUserId);
-  if (bal < amountLites) throw new Error("insufficient balance");
   await query("BEGIN");
   try {
-    await query("INSERT INTO ledger (user_id, delta_lites, reason, ref) VALUES ($1,$2,$3,$4)",
-      [fromUserId, String(-amountLites), "tip", `to:${toUserId}`]);
-    await query("INSERT INTO ledger (user_id, delta_lites, reason, ref) VALUES ($1,$2,$3,$4)",
-      [toUserId, String(amountLites), "tip", `from:${fromUserId}`]);
+    // lock the sender row to serialize concurrent spends
+    await query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [fromId]);
+
+    // compute current balance inside the txn
+    const balRes = await query<{ bal: string }>(
+      `SELECT COALESCE(SUM(delta_lites::bigint), 0) AS bal FROM ledger WHERE user_id = $1`,
+      [fromId]
+    );
+    const cur = BigInt(balRes.rows[0].bal ?? "0");
+    if (cur < amount) throw new Error("Insufficient balance");
+
+    // shared reference to make the pair traceable (and unique)
+    const ref = `tip:${Date.now()}:${fromId}->${toId}:${amount.toString()}`;
+
+    // write sender debit and receiver credit
+    await query(
+      `INSERT INTO ledger (user_id, delta_lites, reason, ref) VALUES ($1,$2,$3,$4)`,
+      [fromId, String(-amount), "tip_out", ref]
+    );
+    await query(
+      `INSERT INTO ledger (user_id, delta_lites, reason, ref) VALUES ($1,$2,$3,$4)`,
+      [toId, String(amount), "tip_in", ref]
+    );
+
     await query("COMMIT");
   } catch (e) {
-    await query("ROLLBACK");
+    await query("ROLLBACK").catch(() => {});
     throw e;
   }
 }
