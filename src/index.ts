@@ -1,6 +1,11 @@
 import "dotenv/config";
 import { Telegraf } from "telegraf";
-import { ensureUser, balanceLites, transfer, findUserByUsername } from "./ledger.js";
+import {
+  ensureUser,
+  balanceLites,
+  transfer,
+  findUserByUsername,
+} from "./ledger.js";
 import { rpc } from "./rpc.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 import { query } from "./db.js";
@@ -10,18 +15,33 @@ if (!botToken) throw new Error("BOT_TOKEN is required");
 
 const bot = new Telegraf(botToken);
 
-// --- helpers ---------------------------------------------------------------
+// ---------------- helpers ----------------
 
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
 const tryDelete = async (ctx: any) => {
   try {
-    if (isGroup(ctx) && ctx.message) {
-      await ctx.deleteMessage();
+    if (isGroup(ctx) && ctx.message) await ctx.deleteMessage();
+  } catch {
+    // ignore if no delete permission
+  }
+};
+
+// Send a message that auto-deletes in groups after `ms`
+const ephemeralReply = async (
+  ctx: any,
+  text: string,
+  ms = 8000,
+  extra: any = {}
+) => {
+  try {
+    const m = await ctx.reply(text, extra);
+    if (isGroup(ctx)) {
+      setTimeout(() => ctx.deleteMessage(m.message_id).catch(() => {}), ms);
     }
   } catch {
-    // ignore (e.g., not admin with delete rights)
+    // ignore
   }
 };
 
@@ -35,36 +55,48 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
 };
 
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
-
-// will be filled after launch (bot’s @username)
-let BOT_AT = "@";
+let BOT_AT = "@"; // set after launch
 const getBotAt = () => BOT_AT;
 
-// --- commands --------------------------------------------------------------
+// ---------------- commands ----------------
 
 bot.start(async (ctx) => {
   await ensureUser(ctx.from);
-  await ctx.reply(`Welcome, ${ctx.from.first_name || "friend"}!\nUse /help for commands.`);
+  const msg = `Welcome, ${
+    ctx.from.first_name || "friend"
+  }!\nUse /help for commands.`;
+  if (isGroup(ctx)) {
+    await tryDelete(ctx);
+    await dm(ctx, msg);
+  } else {
+    await ctx.reply(msg);
+  }
 });
 
 bot.help(async (ctx) => {
-  const lines = [
+  const text = [
     "*Commands*",
     "/deposit — get your LKY deposit address",
     "/balance — show your internal balance",
     "/tip — reply with `/tip 1.23` or `/tip @username 1.23`",
     "/withdraw <address> <amount> — withdraw on-chain",
-  ];
+    isGroup(ctx)
+      ? "\n_Use /deposit, /balance, /withdraw in DM for privacy._"
+      : "",
+  ].join("\n");
   if (isGroup(ctx)) {
-    lines.push("", "_For privacy: use /balance and /deposit in DM with the bot._");
+    await tryDelete(ctx);
+    const ok = await dm(ctx, text, { parse_mode: "Markdown" });
+    if (!ok)
+      await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+  } else {
+    await ctx.reply(text, { parse_mode: "Markdown" });
   }
-  await ctx.reply(lines.join("\n"), { parse_mode: "Markdown" });
 });
 
 bot.command("deposit", async (ctx) => {
   const user = await ensureUser(ctx.from);
 
-  // get or create latest address
   const prev = await query<{ address: string }>(
     "SELECT address FROM wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [user.id]
@@ -76,11 +108,10 @@ bot.command("deposit", async (ctx) => {
   } else {
     const label = String(ctx.from.id);
     addr = await rpc<string>("getnewaddress", [label]);
-    await query("INSERT INTO wallet_addresses (user_id, address, label) VALUES ($1,$2,$3)", [
-      user.id,
-      addr,
-      label,
-    ]);
+    await query(
+      "INSERT INTO wallet_addresses (user_id, address, label) VALUES ($1,$2,$3)",
+      [user.id, addr, label]
+    );
   }
 
   const msg = `Your LKY deposit address:\n\`${addr}\``;
@@ -88,11 +119,8 @@ bot.command("deposit", async (ctx) => {
   if (isGroup(ctx)) {
     await tryDelete(ctx);
     const ok = await dm(ctx, msg, { parse_mode: "Markdown" });
-    if (!ok) {
-      await ctx.reply(`I tried to DM you your address. Please open a chat with me first: ${getBotAt()}`);
-    } else {
-      await ctx.reply("✅ I sent you a DM with your deposit address.");
-    }
+    if (!ok)
+      await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
   } else {
     await ctx.reply(msg, { parse_mode: "Markdown" });
   }
@@ -106,11 +134,8 @@ bot.command("balance", async (ctx) => {
   if (isGroup(ctx)) {
     await tryDelete(ctx);
     const ok = await dm(ctx, text);
-    if (!ok) {
-      await ctx.reply(`I tried to DM your balance. Please open a chat with me first: ${getBotAt()}`);
-    } else {
-      await ctx.reply("✅ I sent you a DM with your balance.");
-    }
+    if (!ok)
+      await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
   } else {
     await ctx.reply(text);
   }
@@ -118,13 +143,17 @@ bot.command("balance", async (ctx) => {
 
 bot.command("tip", async (ctx) => {
   await ensureUser(ctx.from);
+
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
   parts.shift();
 
   let targetUserId: number | null = null;
 
-  if ("reply_to_message" in ctx.message && ctx.message.reply_to_message?.from?.id) {
+  if (
+    "reply_to_message" in ctx.message &&
+    ctx.message.reply_to_message?.from?.id
+  ) {
     targetUserId = ctx.message.reply_to_message.from.id;
   } else if (parts.length >= 2 && parts[0].startsWith("@")) {
     const uname = parts[0].slice(1);
@@ -134,7 +163,14 @@ bot.command("tip", async (ctx) => {
 
   const amountStr = parts[parts.length - 1];
   if (!amountStr) {
-    await ctx.reply("Usage: reply `/tip 1.23` OR `/tip @username 1.23`", { parse_mode: "Markdown" });
+    await ephemeralReply(
+      ctx,
+      "Usage: reply `/tip 1.23` OR `/tip @username 1.23`",
+      6000,
+      {
+        parse_mode: "Markdown",
+      }
+    );
     return;
   }
 
@@ -142,19 +178,23 @@ bot.command("tip", async (ctx) => {
   try {
     amount = parseLkyToLites(amountStr);
   } catch (e: any) {
-    await ctx.reply(`Invalid amount: ${e.message}`);
+    await ephemeralReply(ctx, `Invalid amount: ${e.message}`, 6000);
     return;
   }
   if (!isValidTipAmount(amount)) {
-    await ctx.reply("Amount too small.");
+    await ephemeralReply(ctx, "Amount too small.", 6000);
     return;
   }
   if (!targetUserId) {
-    await ctx.reply("Who are you tipping? Reply to someone or use @username (they must have used the bot before).");
+    await ephemeralReply(
+      ctx,
+      "Who are you tipping? Reply to someone or use @username (they must have used the bot before).",
+      6000
+    );
     return;
   }
   if (targetUserId === ctx.from.id) {
-    await ctx.reply("You can't tip yourself 🙂");
+    await ephemeralReply(ctx, "You can't tip yourself 🙂", 6000);
     return;
   }
 
@@ -164,25 +204,42 @@ bot.command("tip", async (ctx) => {
   try {
     await transfer(from.id, to.id, amount);
   } catch (e: any) {
-    await ctx.reply(`Tip failed: ${e.message}`);
+    await ephemeralReply(ctx, `Tip failed: ${e.message}`, 6000);
     return;
   }
 
   const pretty = formatLky(amount, decimals);
+
   if (isGroup(ctx)) {
-    await tryDelete(ctx);
-    const fromName = ctx.from?.username ? `@${ctx.from.username}` : (ctx.from?.first_name || "Someone");
+    await tryDelete(ctx); // remove the raw /tip command
+    const fromName = ctx.from?.username
+      ? `@${ctx.from.username}`
+      : ctx.from?.first_name || "Someone";
     const toName = to.username ? `@${to.username}` : `user ${to.id}`;
-    await ctx.reply(`💸 ${fromName} tipped ${pretty} LKY to ${toName}`);
+
+    // Short, auto-deleting confirmation to keep chat clean
+    await ephemeralReply(
+      ctx,
+      `💸 ${fromName} → ${toName}: ${pretty} LKY`,
+      12000
+    );
   } else {
-    await ctx.reply(`Sent ${pretty} LKY to ${to.username ? "@" + to.username : "user " + to.id}`);
+    await ctx.reply(
+      `Sent ${pretty} LKY to ${
+        to.username ? "@" + to.username : "user " + to.id
+      }`
+    );
   }
 });
 
 bot.command("withdraw", async (ctx) => {
   if (isGroup(ctx)) {
     await tryDelete(ctx);
-    await ctx.reply(`For safety, use /withdraw in a private chat with me: ${getBotAt()}`);
+    await ephemeralReply(
+      ctx,
+      `Use /withdraw in a private chat with me: ${getBotAt()}`,
+      7000
+    );
     return;
   }
 
@@ -208,18 +265,19 @@ bot.command("withdraw", async (ctx) => {
   }
 
   try {
-    const txid = await rpc<string>("sendtoaddress", [address, Number(amount) / 1e8]);
+    const txid = await rpc<string>("sendtoaddress", [
+      address,
+      Number(amount) / 1e8,
+    ]);
     await query("BEGIN");
     await query(
       "INSERT INTO withdrawals (user_id, to_address, amount_lites, status, txid) VALUES ($1,$2,$3,$4,$5)",
       [user.id, address, String(amount), "sent", txid]
     );
-    await query("INSERT INTO ledger (user_id, delta_lites, reason, ref) VALUES ($1,$2,$3,$4)", [
-      user.id,
-      String(-amount),
-      "withdrawal",
-      txid,
-    ]);
+    await query(
+      "INSERT INTO ledger (user_id, delta_lites, reason, ref) VALUES ($1,$2,$3,$4)",
+      [user.id, String(-amount), "withdrawal", txid]
+    );
     await query("COMMIT");
     await ctx.reply(`Withdrawal sent. txid: ${txid}`);
   } catch (e: any) {
