@@ -7,8 +7,11 @@ type TgUser = {
   last_name?: string | null;
 };
 
-export async function ensureUser(u: TgUser) {
-  // upsert by Telegram user id
+export async function ensureUser(u: {
+  id: number;
+  username?: string | null;
+  first_name?: string | null;
+}) {
   const res = await query<{
     id: number;
     tg_user_id: string;
@@ -18,9 +21,8 @@ export async function ensureUser(u: TgUser) {
     INSERT INTO users (tg_user_id, username, first_name)
     VALUES ($1, $2, $3)
     ON CONFLICT (tg_user_id) DO UPDATE
-      SET username = COALESCE(EXCLUDED.username, users.username),
-          first_name = COALESCE(EXCLUDED.first_name, users.first_name),
-          last_seen = now()
+      SET username  = COALESCE(EXCLUDED.username, users.username),
+          first_name= COALESCE(EXCLUDED.first_name, users.first_name)
     RETURNING id, tg_user_id, username
     `,
     [String(u.id), u.username ?? null, u.first_name ?? null]
