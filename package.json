@@ -13,7 +13,8 @@
     "dev:bot": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
     "db:migrate": "node dist/scripts/migrate.js",
-    "db:migrate:dev": "tsx scripts/migrate.ts"
+    "db:migrate:dev": "tsx scripts/migrate.ts",
+    "rebuild:deposits": "node dist/scripts/rebuild_deposits.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
