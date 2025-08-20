@@ -14,7 +14,8 @@
     "dev:worker": "tsx watch src/worker.ts",
     "db:migrate": "node dist/scripts/migrate.js",
     "db:migrate:dev": "tsx scripts/migrate.ts",
-    "rebuild:deposits": "node dist/scripts/rebuild_deposits.js"
+    "rebuild:deposits": "node dist/scripts/rebuild_deposits.js",
+    "rebuild:withdrawals": "node dist/scripts/rebuild_withdrawals.js"
   },
   "dependencies": {
     "dotenv": "^16.4.5",
