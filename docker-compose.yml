@@ -1,63 +1,43 @@
-version: "3.9"
-
 services:
   postgres:
-    container_name: tipbot-postgres
     image: postgres:16
+    container_name: tipbot-postgres
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: tipbot
     ports:
       - "5432:5432"
-    volumes:
-      - pg:/var/lib/postgresql/data
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-tipbot}",
-        ]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d tipbot"]
       interval: 5s
       timeout: 3s
-      retries: 20
-      start_period: 5s
-    restart: always
+      retries: 30
+    volumes:
+      - pg:/var/lib/postgresql/data
+      # If ./sql contains schema .sql files, Postgres will run them automatically on *first* init of the volume
+      - ./sql:/docker-entrypoint-initdb.d:ro
 
   bot:
-    container_name: tipbot-bot
     build: .
-    environment:
-      BOT_TOKEN: ${BOT_TOKEN}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/tipbot}
-      LKY_RPC_URL: ${LKY_RPC_URL}
-      LKY_RPC_USER: ${LKY_RPC_USER}
-      LKY_RPC_PASS: ${LKY_RPC_PASS}
-      MIN_CONFIRMATIONS: ${MIN_CONFIRMATIONS:-6}
-      DEFAULT_DISPLAY_DECIMALS: ${DEFAULT_DISPLAY_DECIMALS:-8}
+    container_name: tipbot-bot
+    restart: unless-stopped
+    env_file: .env
     depends_on:
       postgres:
         condition: service_healthy
-    # use the actual path used in your logs:
     command: ["node", "dist/src/index.js"]
-    restart: always
 
   worker:
-    container_name: tipbot-worker
     build: .
-    environment:
-      BOT_TOKEN: ${BOT_TOKEN}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/tipbot}
-      LKY_RPC_URL: ${LKY_RPC_URL}
-      LKY_RPC_USER: ${LKY_RPC_USER}
-      LKY_RPC_PASS: ${LKY_RPC_PASS}
-      MIN_CONFIRMATIONS: ${MIN_CONFIRMATIONS:-6}
-      DEFAULT_DISPLAY_DECIMALS: ${DEFAULT_DISPLAY_DECIMALS:-8}
+    container_name: tipbot-worker
+    restart: unless-stopped
+    env_file: .env
     depends_on:
       postgres:
         condition: service_healthy
     command: ["node", "dist/src/worker.js"]
-    restart: always
 
 volumes:
   pg: {}
