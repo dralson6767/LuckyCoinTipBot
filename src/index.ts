@@ -216,7 +216,10 @@ bot.command("tip", async (ctx) => {
       ? `@${ctx.from.username}`
       : ctx.from?.first_name || "Someone";
     const toName = to.username ? `@${to.username}` : `user ${to.id}`;
-    await ctx.reply(`💸 ${fromName} tipped ${pretty} LKY to ${toName}`); // <-- persists
+    //await ctx.reply(`💸 ${fromName} tipped ${pretty} LKY to ${toName}`); // <-- persists
+    await ctx.reply(
+      `💸 ${fromName} tipped ${pretty} LKY to ${toName}\nHODL LuckyCoin for eternal good luck! 🍀`
+    ); // <-- persists
   } else {
     await ctx.reply(
       `Sent ${pretty} LKY to ${
