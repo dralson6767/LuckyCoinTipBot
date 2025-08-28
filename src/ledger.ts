@@ -86,6 +86,7 @@ export async function transfer(fromId: number, toId: number, amount: bigint) {
     throw e;
   }
 }
+
 // Idempotent credit helper for deposits (used by worker.ts)
 export async function credit(
   userId: number,
@@ -94,12 +95,12 @@ export async function credit(
   ref?: string // e.g., txid or "txid:vout"
 ) {
   if (amount <= 0n) throw new Error("amount must be > 0");
-  // If ref is provided, make it idempotent (safe to re-run)
   if (ref) {
+    // IMPORTANT: match the DB constraint (reason, ref)
     await query(
       `INSERT INTO ledger (user_id, delta_lites, reason, ref)
        VALUES ($1,$2,$3,$4)
-       ON CONFLICT (ref) DO NOTHING`,
+       ON CONFLICT ON CONSTRAINT ledger_reason_ref_unique DO NOTHING`,
       [userId, String(amount), reason, ref]
     );
   } else {
