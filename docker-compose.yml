@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:16
@@ -15,8 +17,9 @@ services:
       timeout: 3s
       retries: 30
     volumes:
-      - pg:/var/lib/postgresql/data
-      # If ./sql contains schema .sql files, Postgres will run them automatically on *first* init of the volume
+      # ✅ Adopt the existing persistent data on the VPS:
+      - tipbot_data:/var/lib/postgresql/data
+      # ✅ Optional schema/seed SQLs (run ONLY on first-ever empty volume init):
       - ./sql:/docker-entrypoint-initdb.d:ro
 
   bot:
@@ -39,5 +42,8 @@ services:
         condition: service_healthy
     command: ["node", "dist/src/worker.js"]
 
+# ✅ Name + external so Compose never recreates/migrates it by accident.
 volumes:
-  pg: {}
+  tipbot_data:
+    external: true
+    name: tipbot_data
