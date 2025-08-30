@@ -1,31 +1,39 @@
 # syntax=docker/dockerfile:1
 
-# Base
-FROM node:20-alpine AS base
+# ---------- Install ALL deps (incl. dev) ----------
+FROM node:20-alpine AS deps
 WORKDIR /app
-ENV NODE_ENV=production
-
-# Dependencies layer (shared)
-FROM base AS deps
 COPY package*.json ./
+# Install devDependencies so 'tsc' is available
 RUN npm ci
 
-# Build layer (TypeScript -> dist)
-FROM deps AS build
+# ---------- Build TypeScript ----------
+FROM node:20-alpine AS build
+WORKDIR /app
+# Bring in node_modules (with dev deps) so 'npm run build' works
+COPY --from=deps /app/node_modules ./node_modules
 COPY tsconfig.json ./
 COPY src ./src
+# (Optional) include SQL if your build references it
 COPY sql ./sql
 RUN npm run build
 
-# Runtime image (tiny, has node_modules + dist)
-FROM base AS runtime
+# ---------- Install PROD-only deps ----------
+FROM node:20-alpine AS prod-deps
+WORKDIR /app
+COPY package*.json ./
+# Only production deps for the runtime image
+RUN npm ci --omit=dev
+
+# ---------- Final runtime image ----------
+FROM node:20-alpine AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
-
-# bring in dependencies and built output
-COPY --from=deps /app/node_modules ./node_modules
+# Prod deps only
+COPY --from=prod-deps /app/node_modules ./node_modules
+# Compiled JS
 COPY --from=build /app/dist ./dist
+# Package files (for version/metadata)
 COPY package*.json ./
-
-# Default command can be overridden by docker-compose per service
+# Command is overridden by docker-compose per service
 CMD ["node", "dist/src/index.js"]
