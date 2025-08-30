@@ -1,4 +1,5 @@
-version: "3.9"
+# optional: fixes project name so you don't need -p tipbotclean
+name: tipbotclean
 
 services:
   postgres:
@@ -31,6 +32,8 @@ services:
       postgres:
         condition: service_healthy
     command: ["node", "dist/src/index.js"]
+    # (optional) tiny init so Node isn't PID 1
+    init: true
 
   worker:
     build: .
@@ -41,8 +44,8 @@ services:
       postgres:
         condition: service_healthy
     command: ["node", "dist/src/worker.js"]
+    init: true
 
-# ✅ Name + external so Compose never recreates/migrates it by accident.
 volumes:
   tipbot_data:
     external: true
