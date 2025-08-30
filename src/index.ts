@@ -1,4 +1,3 @@
-// src/index.ts
 import "dotenv/config";
 import { Telegraf } from "telegraf";
 import {
@@ -14,19 +13,17 @@ import { query } from "./db.js";
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 
-// Reduce Telegraf’s handler timeout (default ~90s → 15s)
-const bot = new Telegraf(botToken, { handlerTimeout: 15_000 });
+// ⚠️ default Telegraf (no 15s cap) — avoid p-timeout explosions while we fix the root cause
+const bot = new Telegraf(botToken);
 
-// ---------- small helpers ----------
+// helpers
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
-
 const tryDelete = async (ctx: any) => {
   try {
     if (isGroup(ctx) && ctx.message) await ctx.deleteMessage();
   } catch {}
 };
-
 const ephemeralReply = async (
   ctx: any,
   text: string,
@@ -39,7 +36,6 @@ const ephemeralReply = async (
       setTimeout(() => ctx.deleteMessage(m.message_id).catch(() => {}), ms);
   } catch {}
 };
-
 const dm = async (ctx: any, text: string, extra: any = {}) => {
   try {
     await ctx.telegram.sendMessage(ctx.from.id, text, extra);
@@ -48,17 +44,15 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
     return false;
   }
 };
-
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 let BOT_AT = "@";
 const getBotAt = () => BOT_AT;
 
-// ---------- fast deposit address resolution (DB → label lookup → mint) ----------
+// Fast deposit address: DB → label lookup (4s) → mint (8s)
 async function getFastDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
-  // 1) reuse last known address
   const prev = await query<{ address: string }>(
     "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [userId]
@@ -66,38 +60,31 @@ async function getFastDepositAddress(
   if (prev.rows[0]?.address) return prev.rows[0].address;
 
   const label = String(tgUserId);
-
-  // 2) cheap: ask wallet for any addr by label (short timeout)
   try {
     const map = await rpc<Record<string, unknown>>(
       "getaddressesbylabel",
       [label],
-      4_000
+      4000
     );
     const found = Object.keys(map || {})[0];
     if (found) {
       await query(
-        `INSERT INTO public.wallet_addresses (user_id, address, label)
-         VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING`,
+        "INSERT INTO public.wallet_addresses (user_id, address, label) VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING",
         [userId, found, label]
       );
       return found;
     }
-  } catch {
-    // ignore and mint
-  }
+  } catch {}
 
-  // 3) mint new address (hard 8s cap)
-  const addr = await rpc<string>("getnewaddress", [label], 8_000);
+  const addr = await rpc<string>("getnewaddress", [label], 8000);
   await query(
-    `INSERT INTO public.wallet_addresses (user_id, address, label)
-     VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING`,
+    "INSERT INTO public.wallet_addresses (user_id, address, label) VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING",
     [userId, addr, label]
   );
   return addr;
 }
 
-// ---------- commands ----------
+// commands
 bot.start(async (ctx) => {
   await ensureUser(ctx.from);
   const msg = `Welcome, ${
@@ -122,7 +109,6 @@ bot.help(async (ctx) => {
       ? "\n_Use /deposit, /balance, /withdraw in DM for privacy._"
       : "",
   ].join("\n");
-
   if (isGroup(ctx)) {
     await tryDelete(ctx);
     const ok = await dm(ctx, text, { parse_mode: "Markdown" });
@@ -135,14 +121,10 @@ bot.help(async (ctx) => {
 
 bot.command("deposit", async (ctx) => {
   const user = await ensureUser(ctx.from);
-
-  // Immediately show typing to the user (so it doesn’t feel stuck)
   ctx.telegram.sendChatAction(ctx.chat!.id, "typing").catch(() => {});
-
   try {
     const addr = await getFastDepositAddress(user.id, ctx.from.id);
     const msg = `Your LKY deposit address:\n\`${addr}\``;
-
     if (isGroup(ctx)) {
       await tryDelete(ctx);
       const ok = await dm(ctx, msg, { parse_mode: "Markdown" });
@@ -152,8 +134,7 @@ bot.command("deposit", async (ctx) => {
       await ctx.reply(msg, { parse_mode: "Markdown" });
     }
   } catch {
-    const msg =
-      "Wallet is busy right now.\nPlease try /deposit again in a minute.";
+    const msg = "Wallet is busy. Try /deposit again in a minute.";
     if (isGroup(ctx)) {
       await tryDelete(ctx);
       const ok = await dm(ctx, msg);
@@ -167,9 +148,8 @@ bot.command("deposit", async (ctx) => {
 
 bot.command("balance", async (ctx) => {
   const user = await ensureUser(ctx.from);
-  const bal = await balanceLites(user.id);
+  const bal = await balanceLites(user.id); // pure DB — now bounded by pg statement_timeout (5s)
   const text = `Balance: ${formatLky(bal, decimals)} LKY`;
-
   if (isGroup(ctx)) {
     await tryDelete(ctx);
     const ok = await dm(ctx, text);
@@ -182,7 +162,6 @@ bot.command("balance", async (ctx) => {
 
 bot.command("tip", async (ctx) => {
   await ensureUser(ctx.from);
-
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
   parts.shift();
@@ -191,9 +170,9 @@ bot.command("tip", async (ctx) => {
   if (
     "reply_to_message" in ctx.message &&
     ctx.message.reply_to_message?.from?.id
-  ) {
+  )
     targetUserId = ctx.message.reply_to_message.from.id;
-  } else if (parts.length >= 2 && parts[0].startsWith("@")) {
+  else if (parts.length >= 2 && parts[0].startsWith("@")) {
     const uname = parts[0].slice(1);
     const target = await findUserByUsername(uname);
     if (target) targetUserId = Number(target.tg_user_id);
@@ -224,7 +203,7 @@ bot.command("tip", async (ctx) => {
   if (!targetUserId) {
     await ephemeralReply(
       ctx,
-      "Who are you tipping? Reply to someone or use @username (they must have used the bot before).",
+      "Who are you tipping? Reply to someone or use @username.",
       6000
     );
     return;
@@ -236,7 +215,6 @@ bot.command("tip", async (ctx) => {
 
   const from = await ensureUser(ctx.from);
   const to = await ensureUser({ id: targetUserId });
-
   try {
     await transfer(from.id, to.id, amount);
   } catch (e: any) {
@@ -263,10 +241,7 @@ bot.command("tip", async (ctx) => {
   }
 });
 
-// global error trap
-bot.catch((err) => {
-  console.error("Bot error", err);
-});
+bot.catch((err) => console.error("Bot error", err));
 
 bot.launch().then(async () => {
   try {
@@ -277,7 +252,5 @@ bot.launch().then(async () => {
   }
   console.log("Tipbot is running.");
 });
-
-// log unhandled rejections so we see them in docker logs
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException", e));

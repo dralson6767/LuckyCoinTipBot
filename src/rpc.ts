@@ -5,13 +5,7 @@ const RPC_URL = process.env.LKY_RPC_URL || "";
 const RPC_USER = process.env.LKY_RPC_USER || "";
 const RPC_PASS = process.env.LKY_RPC_PASS || "";
 
-if (!RPC_URL || !RPC_USER || !RPC_PASS) {
-  console.warn(
-    "[rpc] Missing RPC env vars: LKY_RPC_URL / LKY_RPC_USER / LKY_RPC_PASS"
-  );
-}
-
-const DEFAULT_TIMEOUT = Number(process.env.RPC_TIMEOUT_MS ?? "8000"); // 8s
+const DEFAULT_TIMEOUT = Number(process.env.RPC_TIMEOUT_MS ?? "8000"); // 8s cap
 
 export async function rpc<T>(
   method: string,
@@ -19,14 +13,13 @@ export async function rpc<T>(
   timeoutMs = DEFAULT_TIMEOUT
 ): Promise<T> {
   const body: RpcRequest = { jsonrpc: "1.0", id: "lky-tipbot", method, params };
-
   const ctrl = new AbortController();
-  const t = setTimeout(
+  const to = setTimeout(
     () => ctrl.abort(),
     timeoutMs
   ) as unknown as NodeJS.Timeout;
-  // @ts-ignore - not all runtimes have unref
-  t.unref?.();
+  // @ts-ignore
+  to.unref?.();
 
   try {
     const res = await fetch(RPC_URL, {
@@ -40,17 +33,15 @@ export async function rpc<T>(
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
-
-    if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw new Error(`RPC ${method} failed: ${res.status} ${text}`);
-    }
-
-    const json = await res.json();
-    if (json.error) throw new Error(`RPC error: ${json.error.message}`);
-
+    const text = await res.text().catch(() => "");
+    if (!res.ok) throw new Error(`RPC ${method} HTTP ${res.status} ${text}`);
+    const json = text ? JSON.parse(text) : {};
+    if (json?.error)
+      throw new Error(
+        `RPC ${method} error: ${json.error?.message ?? "unknown"}`
+      );
     return json.result as T;
   } finally {
-    clearTimeout(t);
+    clearTimeout(to);
   }
 }
