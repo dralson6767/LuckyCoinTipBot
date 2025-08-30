@@ -1,29 +1,31 @@
 import "dotenv/config";
 import { Telegraf } from "telegraf";
+import { rpc } from "./rpc.js";
+import { query } from "./db.js";
 import {
   ensureUser,
   balanceLites,
   transfer,
   findUserByUsername,
 } from "./ledger.js";
-import { rpc } from "./rpc.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
-import { query } from "./db.js";
 
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 
-// ⚠️ default Telegraf (no 15s cap) — avoid p-timeout explosions while we fix the root cause
+// IMPORTANT: no handlerTimeout here (we want real errors, not p-timeout wrappers)
 const bot = new Telegraf(botToken);
 
-// helpers
+// ---------- helpers ----------
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
+
 const tryDelete = async (ctx: any) => {
   try {
     if (isGroup(ctx) && ctx.message) await ctx.deleteMessage();
   } catch {}
 };
+
 const ephemeralReply = async (
   ctx: any,
   text: string,
@@ -36,6 +38,7 @@ const ephemeralReply = async (
       setTimeout(() => ctx.deleteMessage(m.message_id).catch(() => {}), ms);
   } catch {}
 };
+
 const dm = async (ctx: any, text: string, extra: any = {}) => {
   try {
     await ctx.telegram.sendMessage(ctx.from.id, text, extra);
@@ -44,15 +47,17 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
     return false;
   }
 };
+
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 let BOT_AT = "@";
 const getBotAt = () => BOT_AT;
 
-// Fast deposit address: DB → label lookup (4s) → mint (8s)
+// ---------- fast /deposit address resolution ----------
 async function getFastDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
+  // 1) reuse from DB
   const prev = await query<{ address: string }>(
     "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [userId]
@@ -60,6 +65,8 @@ async function getFastDepositAddress(
   if (prev.rows[0]?.address) return prev.rows[0].address;
 
   const label = String(tgUserId);
+
+  // 2) cheap lookup by label (4s)
   try {
     const map = await rpc<Record<string, unknown>>(
       "getaddressesbylabel",
@@ -69,22 +76,47 @@ async function getFastDepositAddress(
     const found = Object.keys(map || {})[0];
     if (found) {
       await query(
-        "INSERT INTO public.wallet_addresses (user_id, address, label) VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING",
+        `INSERT INTO public.wallet_addresses (user_id, address, label)
+         VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING`,
         [userId, found, label]
       );
       return found;
     }
-  } catch {}
+  } catch {
+    // ignore → mint
+  }
 
+  // 3) mint (8s)
   const addr = await rpc<string>("getnewaddress", [label], 8000);
   await query(
-    "INSERT INTO public.wallet_addresses (user_id, address, label) VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING",
+    `INSERT INTO public.wallet_addresses (user_id, address, label)
+     VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING`,
     [userId, addr, label]
   );
   return addr;
 }
 
-// commands
+// ---------- health ----------
+bot.command("health", async (ctx) => {
+  const out: string[] = [];
+  try {
+    const r = await query<{ now: string }>("select now()::text as now");
+    out.push(`DB: ok (${r.rows[0]?.now})`);
+  } catch (e: any) {
+    out.push(`DB: ERR ${e?.message || e}`);
+  }
+
+  try {
+    const h = await rpc<number>("getblockcount", [], 3000);
+    out.push(`RPC: ok (height ${h})`);
+  } catch (e: any) {
+    out.push(`RPC: ERR ${e?.message || e}`);
+  }
+
+  await ctx.reply(out.join("\n"));
+});
+
+// ---------- commands ----------
 bot.start(async (ctx) => {
   await ensureUser(ctx.from);
   const msg = `Welcome, ${
@@ -120,8 +152,8 @@ bot.help(async (ctx) => {
 });
 
 bot.command("deposit", async (ctx) => {
+  console.log("[/deposit] start", ctx.from?.id, ctx.chat?.id);
   const user = await ensureUser(ctx.from);
-  ctx.telegram.sendChatAction(ctx.chat!.id, "typing").catch(() => {});
   try {
     const addr = await getFastDepositAddress(user.id, ctx.from.id);
     const msg = `Your LKY deposit address:\n\`${addr}\``;
@@ -133,7 +165,9 @@ bot.command("deposit", async (ctx) => {
     } else {
       await ctx.reply(msg, { parse_mode: "Markdown" });
     }
-  } catch {
+    console.log("[/deposit] ok");
+  } catch (e: any) {
+    console.error("[/deposit] ERR", e?.message || e);
     const msg = "Wallet is busy. Try /deposit again in a minute.";
     if (isGroup(ctx)) {
       await tryDelete(ctx);
@@ -147,21 +181,34 @@ bot.command("deposit", async (ctx) => {
 });
 
 bot.command("balance", async (ctx) => {
-  const user = await ensureUser(ctx.from);
-  const bal = await balanceLites(user.id); // pure DB — now bounded by pg statement_timeout (5s)
-  const text = `Balance: ${formatLky(bal, decimals)} LKY`;
-  if (isGroup(ctx)) {
-    await tryDelete(ctx);
-    const ok = await dm(ctx, text);
-    if (!ok)
-      await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
-  } else {
-    await ctx.reply(text);
+  console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
+  try {
+    const user = await ensureUser(ctx.from);
+    const bal = await balanceLites(user.id); // pure DB
+    const text = `Balance: ${formatLky(bal, decimals)} LKY`;
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, text);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(text);
+    }
+    console.log("[/balance] ok");
+  } catch (e: any) {
+    console.error("[/balance] ERR", e?.message || e);
+    await ephemeralReply(
+      ctx,
+      "Balance temporarily unavailable, try again shortly.",
+      6000
+    );
   }
 });
 
 bot.command("tip", async (ctx) => {
+  console.log("[/tip] start");
   await ensureUser(ctx.from);
+
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
   parts.shift();
@@ -170,9 +217,9 @@ bot.command("tip", async (ctx) => {
   if (
     "reply_to_message" in ctx.message &&
     ctx.message.reply_to_message?.from?.id
-  )
+  ) {
     targetUserId = ctx.message.reply_to_message.from.id;
-  else if (parts.length >= 2 && parts[0].startsWith("@")) {
+  } else if (parts.length >= 2 && parts[0].startsWith("@")) {
     const uname = parts[0].slice(1);
     const target = await findUserByUsername(uname);
     if (target) targetUserId = Number(target.tg_user_id);
@@ -215,9 +262,11 @@ bot.command("tip", async (ctx) => {
 
   const from = await ensureUser(ctx.from);
   const to = await ensureUser({ id: targetUserId });
+
   try {
     await transfer(from.id, to.id, amount);
   } catch (e: any) {
+    console.error("[/tip] ERR", e?.message || e);
     await ephemeralReply(ctx, `Tip failed: ${e.message}`, 6000);
     return;
   }
@@ -239,6 +288,7 @@ bot.command("tip", async (ctx) => {
       }`
     );
   }
+  console.log("[/tip] ok");
 });
 
 bot.catch((err) => console.error("Bot error", err));
