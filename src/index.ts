@@ -58,6 +58,66 @@ const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 let BOT_AT = "@"; // set after launch
 const getBotAt = () => BOT_AT;
 
+// ---- deposit address helper (reuses old address; RPC only if none) ----
+
+const RPC_GETADDR_TIMEOUT_MS = Number(
+  process.env.RPC_GETADDR_TIMEOUT_MS || "15000"
+);
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
+async function getOrCreateDepositAddress(tgUserId: number): Promise<string> {
+  // 1) Reuse existing address if present (no RPC → no timeouts)
+  const ex = await query<{ address: string }>(
+    `SELECT w.address
+       FROM public.wallet_addresses w
+       JOIN public.users u ON u.id = w.user_id
+      WHERE u.tg_user_id = $1
+      ORDER BY w.created_at DESC NULLS LAST, w.id DESC
+      LIMIT 1`,
+    [tgUserId]
+  );
+  if (ex.rows[0]?.address) return ex.rows[0].address;
+
+  // 2) No address yet → try to mint a new one via RPC (with short timeout)
+  const label = String(tgUserId);
+  let addr: string;
+  try {
+    addr = await withTimeout(
+      rpc<string>("getnewaddress", [label]),
+      RPC_GETADDR_TIMEOUT_MS,
+      "getnewaddress"
+    );
+  } catch (e) {
+    // Do not crash the bot on slow node — let the caller show a friendly message.
+    throw new Error("wallet RPC busy");
+  }
+
+  // 3) Persist idempotently
+  await query(
+    `INSERT INTO public.wallet_addresses (user_id, address, label)
+     SELECT id, $1, $2 FROM public.users WHERE tg_user_id = $3
+     ON CONFLICT (address) DO NOTHING`,
+    [addr, label, tgUserId]
+  );
+
+  return addr;
+}
+
 // ---------------- commands ----------------
 
 bot.start(async (ctx) => {
@@ -97,32 +157,30 @@ bot.help(async (ctx) => {
 bot.command("deposit", async (ctx) => {
   const user = await ensureUser(ctx.from);
 
-  const prev = await query<{ address: string }>(
-    "SELECT address FROM wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
-    [user.id]
-  );
+  try {
+    const addr = await getOrCreateDepositAddress(ctx.from.id);
+    const msg = `Your LKY deposit address:\n\`${addr}\``;
 
-  let addr: string;
-  if (prev.rows.length) {
-    addr = prev.rows[0].address;
-  } else {
-    const label = String(ctx.from.id);
-    addr = await rpc<string>("getnewaddress", [label]);
-    await query(
-      "INSERT INTO wallet_addresses (user_id, address, label) VALUES ($1,$2,$3)",
-      [user.id, addr, label]
-    );
-  }
-
-  const msg = `Your LKY deposit address:\n\`${addr}\``;
-
-  if (isGroup(ctx)) {
-    await tryDelete(ctx);
-    const ok = await dm(ctx, msg, { parse_mode: "Markdown" });
-    if (!ok)
-      await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
-  } else {
-    await ctx.reply(msg, { parse_mode: "Markdown" });
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg, { parse_mode: "Markdown" });
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg, { parse_mode: "Markdown" });
+    }
+  } catch (e: any) {
+    console.error("deposit handler error", e);
+    const msg =
+      "Wallet is busy right now. Please try /deposit again in a minute.";
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg);
+    }
   }
 });
 
@@ -216,10 +274,9 @@ bot.command("tip", async (ctx) => {
       ? `@${ctx.from.username}`
       : ctx.from?.first_name || "Someone";
     const toName = to.username ? `@${to.username}` : `user ${to.id}`;
-    //await ctx.reply(`💸 ${fromName} tipped ${pretty} LKY to ${toName}`); // <-- persists
     await ctx.reply(
       `💸 ${fromName} tipped ${pretty} LKY to ${toName}\nHODL LuckyCoin for eternal good luck! 🍀`
-    ); // <-- persists
+    ); // persists
   } else {
     await ctx.reply(
       `Sent ${pretty} LKY to ${
