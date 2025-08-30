@@ -58,15 +58,14 @@ const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 let BOT_AT = "@"; // set after launch
 const getBotAt = () => BOT_AT;
 
-// ---- deposit address helper (reuse old; RPC only if none) ----
-
+// ---------- RPC hard timeout wrapper (to prevent 90s hangs) ----------
 const RPC_GETADDR_TIMEOUT_MS = Number(
-  process.env.RPC_GETADDR_TIMEOUT_MS || "15000"
+  process.env.RPC_GETADDR_TIMEOUT_MS || "10000"
 );
 
-function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error(`${label} timeout`)), ms);
+    const t = setTimeout(() => reject(new Error("timeout")), ms);
     p.then(
       (v) => {
         clearTimeout(t);
@@ -80,40 +79,52 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   });
 }
 
-async function getOrCreateDepositAddress(tgUserId: number): Promise<string> {
-  // 1) Reuse existing address if present (no RPC → no timeouts)
-  const ex = await query<{ address: string }>(
-    `SELECT w.address
-       FROM public.wallet_addresses w
-       JOIN public.users u ON u.id = w.user_id
-      WHERE u.tg_user_id = $1
-      ORDER BY w.created_at DESC NULLS LAST, w.id DESC
-      LIMIT 1`,
-    [tgUserId]
+// ---------- Fast deposit address resolution ----------
+// 1) Reuse address from DB (no RPC).
+// 2) If none, cheap label lookup (getaddressesbylabel) — QUICK.
+// 3) Only then mint (getnewaddress) with a 10s hard timeout.
+async function getFastDepositAddress(
+  userId: number,
+  tgUserId: number
+): Promise<string> {
+  // DB reuse
+  const prev = await query<{ address: string }>(
+    "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
+    [userId]
   );
-  if (ex.rows[0]?.address) return ex.rows[0].address;
+  if (prev.rows[0]?.address) return prev.rows[0].address;
 
-  // 2) No address yet → mint one via RPC (with short timeout)
   const label = String(tgUserId);
-  let addr: string;
+
+  // Cheap: getaddressesbylabel (often instant if label exists)
   try {
-    addr = await withTimeout(
-      rpc<string>("getnewaddress", [label]),
-      RPC_GETADDR_TIMEOUT_MS,
-      "getnewaddress"
+    const map = await withTimeout(
+      rpc<Record<string, { purpose: string }>>("getaddressesbylabel", [label]),
+      5000
     );
-  } catch (e) {
-    throw new Error("wallet RPC busy");
+    const found = Object.keys(map || {})[0];
+    if (found) {
+      await query(
+        `INSERT INTO public.wallet_addresses (user_id, address, label)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (address) DO NOTHING`,
+        [userId, found, label]
+      );
+      return found;
+    }
+  } catch {
+    // ignore — just means label isn't there yet or RPC is busy
   }
 
-  // 3) Persist idempotently
-  await query(
-    `INSERT INTO public.wallet_addresses (user_id, address, label)
-     SELECT id, $1, $2 FROM public.users WHERE tg_user_id = $3
-     ON CONFLICT (address) DO NOTHING`,
-    [addr, label, tgUserId]
+  // Mint (hard 10s cap)
+  const addr = await withTimeout(
+    rpc<string>("getnewaddress", [label]),
+    RPC_GETADDR_TIMEOUT_MS
   );
-
+  await query(
+    "INSERT INTO public.wallet_addresses (user_id, address, label) VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING",
+    [userId, addr, label]
+  );
   return addr;
 }
 
@@ -154,10 +165,10 @@ bot.help(async (ctx) => {
 });
 
 bot.command("deposit", async (ctx) => {
-  await ensureUser(ctx.from);
+  const user = await ensureUser(ctx.from);
 
   try {
-    const addr = await getOrCreateDepositAddress(ctx.from.id);
+    const addr = await getFastDepositAddress(user.id, ctx.from.id);
     const msg = `Your LKY deposit address:\n\`${addr}\``;
 
     if (isGroup(ctx)) {
@@ -168,8 +179,7 @@ bot.command("deposit", async (ctx) => {
     } else {
       await ctx.reply(msg, { parse_mode: "Markdown" });
     }
-  } catch (e: any) {
-    console.error("deposit handler error", e);
+  } catch (_e) {
     const msg =
       "Wallet is busy right now. Please try /deposit again in a minute.";
     if (isGroup(ctx)) {
@@ -336,31 +346,18 @@ bot.command("withdraw", async (ctx) => {
   }
 });
 
-// global error trap for update handlers
+// global error trap
 bot.catch((err) => {
   console.error("Bot error", err);
 });
 
-// ----------- STARTUP (force polling, delete webhook, loud logs) -----------
-(async () => {
+// launch (polling)
+bot.launch().then(async () => {
   try {
-    console.log("Tipbot starting… deleting webhook (if any) to force polling.");
-    // Force polling mode in case a webhook was previously configured
-    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-
-    await bot.launch({ dropPendingUpdates: true });
-    let uname = "";
-    try {
-      const me = await bot.telegram.getMe();
-      uname = me?.username || "";
-      BOT_AT = uname ? `@${uname}` : "@";
-    } catch {
-      BOT_AT = "@";
-    }
-    console.log(`Tipbot is running${uname ? ` as @${uname}` : ""}.`);
-  } catch (err) {
-    console.error("bot.launch error", err);
-    // Exit so Docker restarts and we see the error again in logs
-    process.exit(1);
+    const me = await bot.telegram.getMe();
+    BOT_AT = me?.username ? `@${me.username}` : "@";
+  } catch {
+    BOT_AT = "@";
   }
-})();
+  console.log("Tipbot is running.");
+});
