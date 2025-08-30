@@ -58,7 +58,7 @@ const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 let BOT_AT = "@"; // set after launch
 const getBotAt = () => BOT_AT;
 
-// ---- deposit address helper (reuses old address; RPC only if none) ----
+// ---- deposit address helper (reuse old; RPC only if none) ----
 
 const RPC_GETADDR_TIMEOUT_MS = Number(
   process.env.RPC_GETADDR_TIMEOUT_MS || "15000"
@@ -93,7 +93,7 @@ async function getOrCreateDepositAddress(tgUserId: number): Promise<string> {
   );
   if (ex.rows[0]?.address) return ex.rows[0].address;
 
-  // 2) No address yet → try to mint a new one via RPC (with short timeout)
+  // 2) No address yet → mint one via RPC (with short timeout)
   const label = String(tgUserId);
   let addr: string;
   try {
@@ -103,7 +103,6 @@ async function getOrCreateDepositAddress(tgUserId: number): Promise<string> {
       "getnewaddress"
     );
   } catch (e) {
-    // Do not crash the bot on slow node — let the caller show a friendly message.
     throw new Error("wallet RPC busy");
   }
 
@@ -155,7 +154,7 @@ bot.help(async (ctx) => {
 });
 
 bot.command("deposit", async (ctx) => {
-  const user = await ensureUser(ctx.from);
+  await ensureUser(ctx.from);
 
   try {
     const addr = await getOrCreateDepositAddress(ctx.from.id);
@@ -225,9 +224,7 @@ bot.command("tip", async (ctx) => {
       ctx,
       "Usage: reply `/tip 1.23` OR `/tip @username 1.23`",
       6000,
-      {
-        parse_mode: "Markdown",
-      }
+      { parse_mode: "Markdown" }
     );
     return;
   }
@@ -266,17 +263,16 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // keep the confirmation message; only delete the original command
   const pretty = formatLky(amount, decimals);
   if (isGroup(ctx)) {
-    await tryDelete(ctx); // delete the user's /tip command
+    await tryDelete(ctx);
     const fromName = ctx.from?.username
       ? `@${ctx.from.username}`
       : ctx.from?.first_name || "Someone";
     const toName = to.username ? `@${to.username}` : `user ${to.id}`;
     await ctx.reply(
       `💸 ${fromName} tipped ${pretty} LKY to ${toName}\nHODL LuckyCoin for eternal good luck! 🍀`
-    ); // persists
+    );
   } else {
     await ctx.reply(
       `Sent ${pretty} LKY to ${
@@ -340,18 +336,31 @@ bot.command("withdraw", async (ctx) => {
   }
 });
 
-// global error trap
+// global error trap for update handlers
 bot.catch((err) => {
   console.error("Bot error", err);
 });
 
-// launch and capture bot username for DM hints
-bot.launch().then(async () => {
+// ----------- STARTUP (force polling, delete webhook, loud logs) -----------
+(async () => {
   try {
-    const me = await bot.telegram.getMe();
-    BOT_AT = me?.username ? `@${me.username}` : "@";
-  } catch {
-    BOT_AT = "@";
+    console.log("Tipbot starting… deleting webhook (if any) to force polling.");
+    // Force polling mode in case a webhook was previously configured
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+
+    await bot.launch({ dropPendingUpdates: true });
+    let uname = "";
+    try {
+      const me = await bot.telegram.getMe();
+      uname = me?.username || "";
+      BOT_AT = uname ? `@${uname}` : "@";
+    } catch {
+      BOT_AT = "@";
+    }
+    console.log(`Tipbot is running${uname ? ` as @${uname}` : ""}.`);
+  } catch (err) {
+    console.error("bot.launch error", err);
+    // Exit so Docker restarts and we see the error again in logs
+    process.exit(1);
   }
-  console.log("Tipbot is running.");
-});
+})();
