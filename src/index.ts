@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { Telegraf } from "telegraf";
+import { Telegraf, Markup } from "telegraf"; // 👈 CHANGED (added Markup)
 import { rpc } from "./rpc.js";
 import { query } from "./db.js";
 import {
@@ -48,9 +48,26 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
   }
 };
 
+// 👇 NEW: DM a specific Telegram user id (not necessarily ctx.from)
+const dmUser = async (
+  ctx: any,
+  tgUserId: number,
+  text: string,
+  extra: any = {}
+) => {
+  try {
+    await ctx.telegram.sendMessage(tgUserId, text, extra);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 let BOT_AT = "@";
 const getBotAt = () => BOT_AT;
+// 👇 NEW: return bot username without '@' (for deep-link)
+const getBotUsername = () => (BOT_AT.startsWith("@") ? BOT_AT.slice(1) : "");
 
 // ---------- fast /deposit address resolution ----------
 async function getFastDepositAddress(
@@ -213,12 +230,15 @@ bot.command("tip", async (ctx) => {
   const parts = text.trim().split(/\s+/);
   parts.shift();
 
+  // Keep the full Telegram "recipient" user object if we have a reply
+  const replyTo =
+    "reply_to_message" in ctx.message
+      ? ctx.message.reply_to_message?.from
+      : undefined; // 👈 NEW
+
   let targetUserId: number | null = null;
-  if (
-    "reply_to_message" in ctx.message &&
-    ctx.message.reply_to_message?.from?.id
-  ) {
-    targetUserId = ctx.message.reply_to_message.from.id;
+  if (replyTo?.id) {
+    targetUserId = replyTo.id;
   } else if (parts.length >= 2 && parts[0].startsWith("@")) {
     const uname = parts[0].slice(1);
     const target = await findUserByUsername(uname);
@@ -272,21 +292,92 @@ bot.command("tip", async (ctx) => {
   }
 
   const pretty = formatLky(amount, decimals);
+
+  // Build human-friendly names. Prefer the real @username from the replied message if available.
+  const fromName = ctx.from?.username
+    ? `@${ctx.from.username}`
+    : ctx.from?.first_name || "Someone";
+
+  // 👇 CHANGED: prefer @username from replied message, even if user hasn't started the bot
+  const toDisplayFromReply = replyTo?.username ? `@${replyTo.username}` : null;
+
+  const toDisplayFromDb = to.username ? `@${to.username}` : `user ${to.id}`;
+
+  const toDisplay = toDisplayFromReply || toDisplayFromDb;
+
+  // "Has started" heuristic: we only know they've properly started if we have a username stored in DB.
+  const hasStarted = !!to.username; // 👈 NEW (simple, non-invasive heuristic)
+
+  // Deep-link for "Start" button / DM
+  const botUser = getBotUsername();
+  const deepLink = botUser
+    ? `https://t.me/${botUser}?start=claim-${Date.now()}`
+    : "";
+
   if (isGroup(ctx)) {
     await tryDelete(ctx);
-    const fromName = ctx.from?.username
-      ? `@${ctx.from.username}`
-      : ctx.from?.first_name || "Someone";
-    const toName = to.username ? `@${to.username}` : `user ${to.id}`;
-    await ctx.reply(
-      `💸 ${fromName} tipped ${pretty} LKY to ${toName}\nHODL LuckyCoin for eternal good luck! 🍀`
-    );
+
+    const lines = [
+      `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
+      `HODL LuckyCoin for eternal good luck! 🍀`,
+    ];
+
+    // If recipient hasn't started, add a 3rd line to the public message.
+    if (!hasStarted) {
+      lines.push(`🤖 Please check DM to start the bot.`);
+    }
+
+    // Optionally include a public "Start bot" button (harmless if they already started)
+    const extra: any = {};
+    if (!hasStarted && deepLink) {
+      extra.reply_markup = Markup.inlineKeyboard([
+        [Markup.button.url("Start bot to claim", deepLink)],
+      ]);
+    }
+
+    await ctx.reply(lines.join("\n"), extra);
+
+    // Best-effort DM to recipient (will 403 if they truly haven't started yet — that's OK)
+    if (!hasStarted) {
+      const tipper = fromName;
+      const dmText = [
+        `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
+        `Tap “Start” to activate your wallet and claim it.`,
+      ].join("\n");
+
+      // Prefer the reply's user id if we have it; fall back to DB id
+      const targetIdForDm = replyTo?.id ?? to.id;
+
+      if (deepLink) {
+        await dmUser(
+          ctx,
+          targetIdForDm,
+          dmText,
+          Markup.inlineKeyboard([
+            [Markup.button.url("Start the bot", deepLink)],
+          ])
+        );
+      } else {
+        await dmUser(ctx, targetIdForDm, dmText);
+      }
+    }
   } else {
-    await ctx.reply(
-      `Sent ${pretty} LKY to ${
-        to.username ? "@" + to.username : "user " + to.id
-      }`
-    );
+    // DM context (sender is in DM). Keep prior behavior, but we can still try nudging the recipient if they haven't started.
+    await ctx.reply(`Sent ${pretty} LKY to ${toDisplay}`);
+
+    if (!hasStarted && deepLink) {
+      const tipper = fromName;
+      const dmText = [
+        `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
+        `Tap “Start” to activate your wallet and claim it.`,
+      ].join("\n");
+      await dmUser(
+        ctx,
+        replyTo?.id ?? to.id,
+        dmText,
+        Markup.inlineKeyboard([[Markup.button.url("Start the bot", deepLink)]])
+      );
+    }
   }
   console.log("[/tip] ok");
 });
