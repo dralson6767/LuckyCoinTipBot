@@ -89,3 +89,35 @@ export async function transfer(fromId: number, toId: number, amount: bigint) {
     throw e;
   }
 }
+
+// Idempotent credit insert: positive delta_lites.
+export async function credit(
+  userId: number,
+  amount_lites: bigint,
+  reason: string,
+  ref: string | null = null,
+  createdAt?: Date
+): Promise<void> {
+  await query(
+    `INSERT INTO public.ledger (user_id, delta_lites, reason, ref, created_at)
+     VALUES ($1, $2, $3, $4, COALESCE($5, NOW()))
+     ON CONFLICT DO NOTHING`,
+    [userId, String(amount_lites), reason, ref, createdAt ?? null]
+  );
+}
+
+// Optional: symmetric debit (negative delta_lites). Not required if not imported anywhere.
+export async function debit(
+  userId: number,
+  amount_lites: bigint,
+  reason: string,
+  ref: string | null = null,
+  createdAt?: Date
+): Promise<void> {
+  await query(
+    `INSERT INTO public.ledger (user_id, delta_lites, reason, ref, created_at)
+     VALUES ($1, $2, $3, $4, COALESCE($5, NOW()))
+     ON CONFLICT DO NOTHING`,
+    [userId, String(-amount_lites), reason, ref, createdAt ?? null]
+  );
+}
