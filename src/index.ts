@@ -74,7 +74,7 @@ async function getFastDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
-  // 1) reuse from DB
+  // 1) reuse from DB if we already stored an address
   const prev = await query<{ address: string }>(
     "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [userId]
@@ -83,34 +83,49 @@ async function getFastDepositAddress(
 
   const label = String(tgUserId);
 
-  // 2) cheap lookup by label (4s)
+  // helper to persist the address once we find one
+  const remember = async (addr: string) => {
+    await query(
+      `INSERT INTO public.wallet_addresses (user_id, address, label)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (address) DO NOTHING`,
+      [userId, addr, label]
+    );
+    return addr;
+  };
+
+  // 2) Newer Bitcoin-style (your node returns "Method not found")
   try {
     const map = await rpc<Record<string, unknown>>(
       "getaddressesbylabel",
       [label],
       4000
     );
-    const found = Object.keys(map || {})[0];
-    if (found) {
-      await query(
-        `INSERT INTO public.wallet_addresses (user_id, address, label)
-         VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING`,
-        [userId, found, label]
-      );
-      return found;
-    }
+    const existing = Object.keys(map || {})[0];
+    if (existing) return remember(existing);
   } catch {
-    // ignore → mint
+    // ignore → try legacy methods next
   }
 
-  // 3) mint (8s)
+  // 3) Legacy list for an "account" label
+  try {
+    const list = await rpc<string[]>("getaddressesbyaccount", [label], 4000);
+    if (Array.isArray(list) && list[0]) return remember(list[0]);
+  } catch {
+    // ignore → try legacy single-account default receive address
+  }
+
+  // 4) Legacy single "account" default receive address
+  try {
+    const addr = await rpc<string>("getaccountaddress", [label], 6000);
+    if (addr) return remember(addr);
+  } catch {
+    // ignore → mint fresh
+  }
+
+  // 5) Always works on old daemons: mint a new address for this label/account
   const addr = await rpc<string>("getnewaddress", [label], 8000);
-  await query(
-    `INSERT INTO public.wallet_addresses (user_id, address, label)
-     VALUES ($1,$2,$3) ON CONFLICT (address) DO NOTHING`,
-    [userId, addr, label]
-  );
-  return addr;
+  return remember(addr);
 }
 
 // ---------- health ----------
