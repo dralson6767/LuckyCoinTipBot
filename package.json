@@ -1,15 +1,15 @@
 {
   "name": "tipbot-lky",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "private": true,
   "engines": {
     "node": ">=18.17.0"
   },
   "scripts": {
-    "build": "tsc -p .",
+    "build": "tsc -p tsconfig.json",
     "start:bot": "node dist/src/index.js",
-    "start:worker": "node dist/src/worker.js",
+    "start:worker": "node dist/src/bootstrap.js && node dist/src/worker.js",
     "dev:bot": "tsx watch src/index.ts",
     "dev:worker": "tsx watch src/worker.ts",
     "db:migrate": "node dist/scripts/migrate.js",

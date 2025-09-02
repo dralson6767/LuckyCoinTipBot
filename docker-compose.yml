@@ -15,6 +15,7 @@ services:
       timeout: 3s
       retries: 30
     volumes:
+      # Logical alias → pinned to the GOOD physical volume below
       - tipbot_data:/var/lib/postgresql/data
       - ./sql:/docker-entrypoint-initdb.d:ro
 
@@ -26,7 +27,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["node", "dist/src/index.js"]
+    # ensure we run the npm script
+    command: ["npm", "run", "start:bot"]
 
   worker:
     build: .
@@ -36,9 +38,11 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    command: ["node", "dist/src/worker.js"]
+    # bootstrap runs first on every start, then the worker
+    command: ["npm", "run", "start:worker"]
 
 volumes:
   tipbot_data:
     external: true
-    name: tipbot_data
+    # bind the logical volume to the canonical GOOD volume on the VPS
+    name: tipbotclean_pg
