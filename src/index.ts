@@ -8,7 +8,7 @@ import {
   balanceLites,
   transfer,
   findUserByUsername,
-  debit, // 👈 used for withdrawal ledger debit
+  debit,
 } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
@@ -17,7 +17,7 @@ const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 const bot = new Telegraf(botToken);
 
-// ---------- small helpers ----------
+// ---------- helpers ----------
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
@@ -50,7 +50,6 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
   }
 };
 
-// DM a specific user id
 const dmUser = async (
   ctx: any,
   tgUserId: number,
@@ -71,7 +70,7 @@ let BOT_AT = "@";
 const getBotAt = () => BOT_AT;
 const getBotUsername = () => (BOT_AT.startsWith("@") ? BOT_AT.slice(1) : "");
 
-// ---------- robust RPC helpers ----------
+// ---------- RPC helpers ----------
 type RpcErr = { code?: number; message?: string };
 const isWalletBusy = (e: any) =>
   /rescanning|loading wallet|loading block|resource busy|database is locked/i.test(
@@ -93,12 +92,11 @@ async function rpcTry<T>(
   }
 }
 
-// ---------- fast /deposit address resolution ----------
+// ---------- /deposit address fast path ----------
 async function getFastDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
-  // 0) reuse from DB if present
   const prev = await query<{ address: string }>(
     "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [userId]
@@ -118,7 +116,7 @@ async function getFastDepositAddress(
     return addr;
   };
 
-  // 1) Newer (labels)
+  // 1) labels
   {
     const r = await rpcTry<Record<string, unknown>>(
       "getaddressesbylabel",
@@ -130,22 +128,19 @@ async function getFastDepositAddress(
       if (existing) return remember(existing);
     }
   }
-
-  // 2) Legacy: list addresses by account
+  // 2) legacy account list
   {
     const r = await rpcTry<string[]>("getaddressesbyaccount", [label], 4000);
     if (r.ok && Array.isArray(r.value) && r.value[0]) {
       return remember(r.value[0]);
     }
   }
-
-  // 3) Legacy: default address for account
+  // 3) legacy default account address
   {
     const r = await rpcTry<string>("getaccountaddress", [label], 6000);
     if (r.ok && r.value) return remember(r.value);
   }
-
-  // 4) Fallback: mint new address (retry once if busy)
+  // 4) mint new (retry once if busy)
   {
     const attempt = async () => rpcTry<string>("getnewaddress", [label], 8000);
     let r = await attempt();
@@ -273,34 +268,43 @@ bot.command("balance", async (ctx) => {
   }
 });
 
+// ---------- resolve @username to user id (DB → Telegram → fail) ----------
+async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
+  const uname = unameRaw.replace(/^@/, "");
+  // DB first
+  const inDb = await findUserByUsername(uname);
+  if (inDb) return Number(inDb.tg_user_id);
+
+  // Try Telegram (works only if API allows the bot to see this user)
+  try {
+    const chat = await ctx.telegram.getChat("@" + uname);
+    if (chat?.id) {
+      // persist immediately so future tips resolve from DB
+      await ensureUser({ id: chat.id, username: uname });
+      return Number(chat.id);
+    }
+  } catch {
+    // ignored; will return null
+  }
+  return null;
+}
+
 // ----- /tip -----
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
-  // Ensure sender is up-to-date (captures username changes on every tip)
   const from = await ensureUser(ctx.from);
 
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
-  parts.shift();
+  parts.shift(); // remove '/tip'
 
-  // Full Telegram "recipient" if we have a reply
   const replyTo =
     "reply_to_message" in ctx.message
       ? ctx.message.reply_to_message?.from
       : undefined;
 
-  let targetUserId: number | null = null;
-  let targetUsernameFromCmd: string | null = null;
-
-  if (replyTo?.id) {
-    targetUserId = replyTo.id;
-  } else if (parts.length >= 2 && parts[0].startsWith("@")) {
-    targetUsernameFromCmd = parts[0].slice(1);
-    const target = await findUserByUsername(targetUsernameFromCmd);
-    if (target) targetUserId = Number(target.tg_user_id);
-  }
-
+  // Parse amount (last token)
   const amountStr = parts[parts.length - 1];
   if (!amountStr) {
     await ephemeralReply(
@@ -323,7 +327,39 @@ bot.command("tip", async (ctx) => {
     await ephemeralReply(ctx, "Amount too small.", 6000);
     return;
   }
-  if (!targetUserId) {
+
+  // Determine recipient id
+  let targetUserId: number | null = null;
+  let displayTag: string | null = null;
+
+  if (replyTo?.id) {
+    targetUserId = Number(replyTo.id);
+    displayTag = replyTo.username ? `@${replyTo.username}` : null;
+    // keep DB fresh for replied users
+    await ensureUser(replyTo);
+  } else if (parts.length >= 2 && parts[0].startsWith("@")) {
+    const uname = parts[0].slice(1);
+    targetUserId = await resolveUserIdByUsername(ctx, uname);
+    displayTag = "@" + uname;
+    if (!targetUserId) {
+      // Cannot resolve → they haven't started; show deep-link prompt and exit
+      const botUser = getBotUsername();
+      const deepLink = botUser
+        ? `https://t.me/${botUser}?start=claim-${Date.now()}`
+        : "";
+      const msg = deepLink
+        ? `User ${displayTag} hasn’t started the bot. Ask them to tap: ${deepLink}`
+        : `User ${displayTag} hasn’t started the bot yet.`;
+      if (isGroup(ctx)) {
+        await tryDelete(ctx);
+        const ok = await dm(ctx, msg);
+        if (!ok) await ephemeralReply(ctx, msg, 8000);
+      } else {
+        await ctx.reply(msg);
+      }
+      return;
+    }
+  } else {
     await ephemeralReply(
       ctx,
       "Who are you tipping? Reply to someone or use @username.",
@@ -331,16 +367,15 @@ bot.command("tip", async (ctx) => {
     );
     return;
   }
+
   if (targetUserId === ctx.from.id) {
     await ephemeralReply(ctx, "You can't tip yourself 🙂", 6000);
     return;
   }
 
-  // Ensure recipient — pass the FULL replyTo object if present (so username updates)
+  // Ensure recipient exists in DB (update username if we have it)
   const to = await ensureUser(
-    replyTo
-      ? replyTo
-      : { id: targetUserId, username: targetUsernameFromCmd || undefined }
+    replyTo ? replyTo : { id: targetUserId, username: displayTag || undefined }
   );
 
   // Execute transfer
@@ -353,48 +388,38 @@ bot.command("tip", async (ctx) => {
   }
 
   const pretty = formatLky(amount, decimals);
-
-  // Human-friendly names
   const fromName = ctx.from?.username
     ? `@${ctx.from.username}`
     : ctx.from?.first_name || "Someone";
+  const toDisplay =
+    displayTag || (to as any).username
+      ? displayTag || `@${(to as any).username}`
+      : `user ${to.id}`;
 
-  const toDisplayFromReply = replyTo?.username ? `@${replyTo.username}` : null;
-  const toDisplayFromDb = (to as any).username
-    ? `@${(to as any).username}`
-    : `user ${to.id}`;
-  let toDisplay = toDisplayFromReply || toDisplayFromDb;
-
-  // Heuristic: started if we have username in DB; try DM once to confirm
-  let hasStarted = !!(to as any).username;
-
+  // Build deep link
   const botUser = getBotUsername();
   const deepLink = botUser
     ? `https://t.me/${botUser}?start=claim-${Date.now()}`
     : "";
 
+  // Always attempt one DM; if it fails, we show the "Start bot" line & button
   const tipper = fromName;
   const dmText = [
     `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
     `Tap “Start” to activate your wallet and claim it.`,
   ].join("\n");
 
+  let dmOk = await dmUser(
+    ctx,
+    replyTo?.id ?? targetUserId,
+    dmText,
+    deepLink
+      ? Markup.inlineKeyboard([[Markup.button.url("Start the bot", deepLink)]])
+      : undefined
+  );
+
   if (isGroup(ctx)) {
     await tryDelete(ctx);
-
-    if (!hasStarted) {
-      const dmOk = await dmUser(
-        ctx,
-        replyTo?.id ?? to.id,
-        dmText,
-        deepLink
-          ? Markup.inlineKeyboard([
-              [Markup.button.url("Start the bot", deepLink)],
-            ])
-          : undefined
-      );
-      if (dmOk) hasStarted = true;
-    }
 
     const lines = [
       `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
@@ -402,7 +427,7 @@ bot.command("tip", async (ctx) => {
     ];
 
     const extra: any = { parse_mode: "Markdown" };
-    if (!hasStarted && deepLink) {
+    if (!dmOk && deepLink) {
       lines.push(`🤖 Recipient must *Start* the bot to receive the DM.`);
       extra.reply_markup = Markup.inlineKeyboard([
         [Markup.button.url("Start bot to claim", deepLink)],
@@ -411,27 +436,27 @@ bot.command("tip", async (ctx) => {
     await ctx.reply(lines.join("\n"), extra);
   } else {
     await ctx.reply(`Sent ${pretty} LKY to ${toDisplay}`);
-    if (!hasStarted && deepLink) {
+    if (!dmOk && deepLink) {
       await dmUser(
         ctx,
-        replyTo?.id ?? to.id,
+        replyTo?.id ?? targetUserId,
         dmText,
         Markup.inlineKeyboard([[Markup.button.url("Start the bot", deepLink)]])
       );
     }
   }
+
   console.log("[/tip] ok");
 });
 
 // ----- /withdraw -----
-// Usage: /withdraw <address> <amount>
 bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] start");
   const sender = await ensureUser(ctx.from);
 
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
-  parts.shift(); // remove '/withdraw'
+  parts.shift();
 
   if (parts.length < 2) {
     const msg = "Usage: /withdraw <address> <amount>";
@@ -475,7 +500,6 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  // Check balance
   const bal = await balanceLites(sender.id);
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
@@ -493,7 +517,6 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  // Validate address (best-effort; if node lacks the method, continue)
   const v = await rpcTry<any>("validateaddress", [toAddress], 5000);
   if (v.ok && v.value && v.value.isvalid === false) {
     const msg = "Invalid address.";
@@ -508,8 +531,7 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  // Send on-chain (LuckyCoin nodes expect amount in LKY float)
-  const amtStr = formatLky(amount, 8); // "1.23456789"
+  const amtStr = formatLky(amount, 8);
   const send = await rpcTry<string>(
     "sendtoaddress",
     [toAddress, Number(amtStr)],
@@ -541,7 +563,6 @@ bot.command("withdraw", async (ctx) => {
 
   const txid = send.value;
 
-  // Record withdrawal row + debit ledger (idempotent via UNIQUE + our ledger constraint)
   try {
     await query(
       `INSERT INTO public.withdrawals (user_id, to_address, amount_lites, txid, status, created_at)
@@ -570,7 +591,7 @@ bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] ok", txid);
 });
 
-// ---------- error & launch ----------
+// ---------- errors & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
 bot.launch().then(async () => {
