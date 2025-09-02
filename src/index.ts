@@ -1,5 +1,6 @@
+// src/index.ts
 import "dotenv/config";
-import { Telegraf, Markup } from "telegraf"; // 👈 CHANGED (added Markup)
+import { Telegraf, Markup } from "telegraf";
 import { rpc } from "./rpc.js";
 import { query } from "./db.js";
 import {
@@ -10,13 +11,12 @@ import {
 } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
+// ---------- bot init ----------
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
-
-// IMPORTANT: no handlerTimeout here (we want real errors, not p-timeout wrappers)
 const bot = new Telegraf(botToken);
 
-// ---------- helpers ----------
+// ---------- small helpers ----------
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
@@ -43,12 +43,13 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
   try {
     await ctx.telegram.sendMessage(ctx.from.id, text, extra);
     return true;
-  } catch {
+  } catch (e: any) {
+    console.error("[dm] failed:", e?.message || e);
     return false;
   }
 };
 
-// 👇 NEW: DM a specific Telegram user id (not necessarily ctx.from)
+// DM a specific Telegram user id (not necessarily ctx.from)
 const dmUser = async (
   ctx: any,
   tgUserId: number,
@@ -58,7 +59,8 @@ const dmUser = async (
   try {
     await ctx.telegram.sendMessage(tgUserId, text, extra);
     return true;
-  } catch {
+  } catch (e: any) {
+    console.error("[dmUser] failed:", e?.message || e);
     return false;
   }
 };
@@ -66,15 +68,38 @@ const dmUser = async (
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 let BOT_AT = "@";
 const getBotAt = () => BOT_AT;
-// 👇 NEW: return bot username without '@' (for deep-link)
 const getBotUsername = () => (BOT_AT.startsWith("@") ? BOT_AT.slice(1) : "");
+
+// ---------- robust RPC helpers ----------
+type RpcErr = { code?: number; message?: string };
+const isLikelyMethodMissing = (e: any) =>
+  /Method not found/i.test(String(e?.message || e));
+const isWalletBusy = (e: any) =>
+  /rescanning|loading wallet|loading block|resource busy|database is locked/i.test(
+    String(e?.message || e)
+  ) ||
+  e?.code === -4 ||
+  e?.code === -28;
+
+async function rpcTry<T>(
+  method: string,
+  params: any[],
+  timeoutMs: number
+): Promise<{ ok: true; value: T } | { ok: false; err: RpcErr | any }> {
+  try {
+    const v = await rpc<T>(method, params, timeoutMs);
+    return { ok: true, value: v };
+  } catch (e: any) {
+    return { ok: false, err: e };
+  }
+}
 
 // ---------- fast /deposit address resolution ----------
 async function getFastDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
-  // 1) reuse from DB if we already stored an address
+  // 0) reuse from DB if present
   const prev = await query<{ address: string }>(
     "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [userId]
@@ -82,50 +107,62 @@ async function getFastDepositAddress(
   if (prev.rows[0]?.address) return prev.rows[0].address;
 
   const label = String(tgUserId);
-
-  // helper to persist the address once we find one
   const remember = async (addr: string) => {
-    await query(
-      `INSERT INTO public.wallet_addresses (user_id, address, label)
-       VALUES ($1,$2,$3)
-       ON CONFLICT (address) DO NOTHING`,
-      [userId, addr, label]
-    );
+    try {
+      await query(
+        `INSERT INTO public.wallet_addresses (user_id, address, label)
+         VALUES ($1,$2,$3)
+         ON CONFLICT (address) DO NOTHING`,
+        [userId, addr, label]
+      );
+    } catch (e) {
+      // ignore — address still returned
+    }
     return addr;
   };
 
-  // 2) Newer Bitcoin-style (your node returns "Method not found")
-  try {
-    const map = await rpc<Record<string, unknown>>(
+  // 1) Newer (labels)
+  {
+    const r = await rpcTry<Record<string, unknown>>(
       "getaddressesbylabel",
       [label],
       4000
     );
-    const existing = Object.keys(map || {})[0];
-    if (existing) return remember(existing);
-  } catch {
-    // ignore → try legacy methods next
+    if (r.ok) {
+      const existing = Object.keys(r.value || {})[0];
+      if (existing) return remember(existing);
+    } // else ignore "Method not found" and continue
   }
 
-  // 3) Legacy list for an "account" label
-  try {
-    const list = await rpc<string[]>("getaddressesbyaccount", [label], 4000);
-    if (Array.isArray(list) && list[0]) return remember(list[0]);
-  } catch {
-    // ignore → try legacy single-account default receive address
+  // 2) Legacy: list addresses by account
+  {
+    const r = await rpcTry<string[]>("getaddressesbyaccount", [label], 4000);
+    if (r.ok && Array.isArray(r.value) && r.value[0]) {
+      return remember(r.value[0]);
+    }
   }
 
-  // 4) Legacy single "account" default receive address
-  try {
-    const addr = await rpc<string>("getaccountaddress", [label], 6000);
-    if (addr) return remember(addr);
-  } catch {
-    // ignore → mint fresh
+  // 3) Legacy: default address for account
+  {
+    const r = await rpcTry<string>("getaccountaddress", [label], 6000);
+    if (r.ok && r.value) return remember(r.value);
   }
 
-  // 5) Always works on old daemons: mint a new address for this label/account
-  const addr = await rpc<string>("getnewaddress", [label], 8000);
-  return remember(addr);
+  // 4) Fallback: mint new address for this label — with a quick retry if wallet is “busy”
+  {
+    const attempt = async () => rpcTry<string>("getnewaddress", [label], 8000);
+
+    let r = await attempt();
+    if (!r.ok && isWalletBusy(r.err)) {
+      // quick retry once after short sleep
+      await new Promise((res) => setTimeout(res, 800));
+      r = await attempt();
+    }
+    if (r.ok && r.value) return remember(r.value);
+  }
+
+  // If every path failed, return a deterministic error up-stack (caller decides message)
+  throw new Error("DEPOSIT_ADDR_FAILED");
 }
 
 // ---------- health ----------
@@ -200,7 +237,11 @@ bot.command("deposit", async (ctx) => {
     console.log("[/deposit] ok");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
-    const msg = "Wallet is busy. Try /deposit again in a minute.";
+    // Friendlier, precise messaging
+    const msg =
+      isWalletBusy(e) || /DEPOSIT_ADDR_FAILED/.test(String(e))
+        ? "Wallet is busy. Try /deposit again in a minute."
+        : "Wallet temporarily unavailable. Try /deposit again shortly.";
     if (isGroup(ctx)) {
       await tryDelete(ctx);
       const ok = await dm(ctx, msg);
@@ -216,7 +257,7 @@ bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await balanceLites(user.id); // pure DB
+    const bal = await balanceLites(user.id);
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       await tryDelete(ctx);
@@ -245,11 +286,11 @@ bot.command("tip", async (ctx) => {
   const parts = text.trim().split(/\s+/);
   parts.shift();
 
-  // Keep the full Telegram "recipient" user object if we have a reply
+  // Full Telegram "recipient" user object if we have a reply
   const replyTo =
     "reply_to_message" in ctx.message
       ? ctx.message.reply_to_message?.from
-      : undefined; // 👈 NEW
+      : undefined;
 
   let targetUserId: number | null = null;
   if (replyTo?.id) {
@@ -308,22 +349,21 @@ bot.command("tip", async (ctx) => {
 
   const pretty = formatLky(amount, decimals);
 
-  // Build human-friendly names. Prefer the real @username from the replied message if available.
+  // Human-friendly names
   const fromName = ctx.from?.username
     ? `@${ctx.from.username}`
     : ctx.from?.first_name || "Someone";
 
-  // 👇 CHANGED: prefer @username from replied message, even if user hasn't started the bot
   const toDisplayFromReply = replyTo?.username ? `@${replyTo.username}` : null;
-
-  const toDisplayFromDb = to.username ? `@${to.username}` : `user ${to.id}`;
-
+  const toDisplayFromDb = (to as any).username
+    ? `@${(to as any).username}`
+    : `user ${to.id}`;
   const toDisplay = toDisplayFromReply || toDisplayFromDb;
 
-  // "Has started" heuristic: we only know they've properly started if we have a username stored in DB.
-  const hasStarted = !!to.username; // 👈 NEW (simple, non-invasive heuristic)
+  // "Has started" heuristic: we only know they've started if we have a username stored
+  const hasStarted = !!(to as any).username;
 
-  // Deep-link for "Start" button / DM
+  // Deep-link to start the bot (bots cannot DM first)
   const botUser = getBotUsername();
   const deepLink = botUser
     ? `https://t.me/${botUser}?start=claim-${Date.now()}`
@@ -336,33 +376,26 @@ bot.command("tip", async (ctx) => {
       `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
       `HODL LuckyCoin for eternal good luck! 🍀`,
     ];
-
-    // If recipient hasn't started, add a 3rd line to the public message.
     if (!hasStarted) {
-      lines.push(`🤖 Please check DM to start the bot.`);
+      lines.push(`🤖 Recipient must *Start* the bot to receive the DM.`);
     }
 
-    // Optionally include a public "Start bot" button (harmless if they already started)
-    const extra: any = {};
+    const extra: any = { parse_mode: "Markdown" };
     if (!hasStarted && deepLink) {
       extra.reply_markup = Markup.inlineKeyboard([
         [Markup.button.url("Start bot to claim", deepLink)],
       ]);
     }
-
     await ctx.reply(lines.join("\n"), extra);
 
-    // Best-effort DM to recipient (will 403 if they truly haven't started yet — that's OK)
+    // Try a DM anyway; will fail (403) if they haven't started — we swallow it.
     if (!hasStarted) {
       const tipper = fromName;
       const dmText = [
         `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
         `Tap “Start” to activate your wallet and claim it.`,
       ].join("\n");
-
-      // Prefer the reply's user id if we have it; fall back to DB id
       const targetIdForDm = replyTo?.id ?? to.id;
-
       if (deepLink) {
         await dmUser(
           ctx,
@@ -377,9 +410,8 @@ bot.command("tip", async (ctx) => {
       }
     }
   } else {
-    // DM context (sender is in DM). Keep prior behavior, but we can still try nudging the recipient if they haven't started.
+    // DM context
     await ctx.reply(`Sent ${pretty} LKY to ${toDisplay}`);
-
     if (!hasStarted && deepLink) {
       const tipper = fromName;
       const dmText = [
@@ -397,6 +429,7 @@ bot.command("tip", async (ctx) => {
   console.log("[/tip] ok");
 });
 
+// ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
 bot.launch().then(async () => {
@@ -408,5 +441,6 @@ bot.launch().then(async () => {
   }
   console.log("Tipbot is running.");
 });
+
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException", e));
