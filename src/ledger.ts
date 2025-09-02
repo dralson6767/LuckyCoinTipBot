@@ -86,7 +86,7 @@ async function insertLedger(
   const res = await query<{ id: number }>(
     `INSERT INTO public.ledger(user_id, delta_lites, reason, ref, created_at)
      VALUES ($1, $2::bigint, $3, $4, $5)
-     ON CONSTRAINT ledger_reason_ref_unique DO NOTHING
+     ON CONFLICT ON CONSTRAINT ledger_reason_ref_unique DO NOTHING
      RETURNING id`,
     [userId, delta.toString(), reason, ref, ts]
   );
@@ -105,18 +105,13 @@ async function insertLedger(
     try {
       await query(`SELECT public.tips_try_pair($1::BIGINT)`, [id]);
     } catch {
-      // ignore; bootstrap sweep will pair later
+      /* ignore */
     }
   }
   return id;
 }
 
-/**
- * CREDIT: positive delta. This is what scan_explorer.ts / worker.ts import.
- * Signature kept flexible so existing calls compile:
- *  - amount can be bigint | number | string (already in lites)
- *  - at is optional Date
- */
+/** CREDIT: positive delta (exported for scan_explorer/worker). */
 export async function credit(
   userId: number,
   amountLites: bigint | number | string,
@@ -144,10 +139,7 @@ export async function debit(
   return insertLedger(userId, -amt, reason, ref, at);
 }
 
-/**
- * High-level tip transfer: writes tip_out and tip_in with the SAME ref,
- * then tries to pair them immediately.
- */
+/** High-level tip transfer: writes tip_out and tip_in with the SAME ref. */
 export async function transfer(
   fromUserId: number,
   toUserId: number,
@@ -175,13 +167,12 @@ export async function transfer(
     new Date()
   );
 
-  // If for some reason we didn't get ids (duplicate ref), attempt pairing anyway.
   try {
     if (outId != null)
       await query(`SELECT public.tips_try_pair($1::BIGINT)`, [outId]);
     if (inId != null)
       await query(`SELECT public.tips_try_pair($1::BIGINT)`, [inId]);
   } catch {
-    // ignore
+    /* ignore */
   }
 }
