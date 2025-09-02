@@ -45,4 +45,4 @@ volumes:
   tipbot_data:
     external: true
     # bind the logical volume to the canonical GOOD volume on the VPS
-    name: tipbotclean_pg
+    name: tipbot_pg_sql_2025_08_31_031701

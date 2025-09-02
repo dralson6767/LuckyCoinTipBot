@@ -1,11 +1,12 @@
 /**
  * Idempotent DB bootstrap that runs on every worker start.
  * - Enforces required constraints (safe to re-run)
+ * - (Re)creates tips pairing function + trigger (safe to re-run)
  * - Credits deposits to ledger (min confirmations or credited=true)
  * - Debits withdrawals to ledger
  * - Pairs tips from existing ledger rows (strict 10-min window)
  *
- * This makes restarts/rebuilds self-heal: data only grows, never rolls back.
+ * Result: restarts/rebuilds self-heal. Data only grows; never rolls back to deposit-only.
  */
 import { Client } from "pg";
 
@@ -20,7 +21,10 @@ async function main() {
   const c = new Client({ connectionString: url });
   await c.connect();
 
-  console.log("[bootstrap] connected; enforcing constraints…");
+  console.log("[bootstrap] connected; enforcing search_path + constraints…");
+
+  // 0) Ensure search_path
+  await c.query(`ALTER DATABASE tipbot SET search_path = public;`);
 
   // 1) Constraints we rely on (safe to rerun)
   await c.query(`
@@ -39,9 +43,119 @@ async function main() {
     END IF;
   END $$;`);
 
-  console.log("[bootstrap] constraints ok; posting deposits → ledger…");
+  console.log(
+    "[bootstrap] constraints ok; (re)installing tips functions & trigger…"
+  );
 
-  // 2) Deposits → ledger (credit) idempotent
+  // 2) (Re)install tips pairing function(s) and trigger (idempotent)
+  await c.query(`
+  -- tips_try_pair: BIGINT overload (canonical)
+  CREATE OR REPLACE FUNCTION public.tips_try_pair(p_ledger_id BIGINT)
+  RETURNS VOID
+  LANGUAGE plpgsql
+  AS $$
+  DECLARE
+    r_ledger RECORD;
+    match_ledger_id BIGINT;
+  BEGIN
+    -- load the inserted ledger row
+    SELECT id, user_id, delta_lites, created_at, reason
+      INTO r_ledger
+    FROM public.ledger
+    WHERE id = p_ledger_id;
+
+    IF NOT FOUND THEN
+      RETURN;
+    END IF;
+
+    -- only process tip/rain/airdrop reasons
+    IF r_ledger.reason NOT IN ('tip_out','rain_out','airdrop_out','tip_in','rain_in','airdrop_in') THEN
+      RETURN;
+    END IF;
+
+    -- find the counterpart: same abs(amount), different user, opposite sign, within ±5 min
+    IF r_ledger.reason IN ('tip_out','rain_out','airdrop_out') THEN
+      SELECT l.id
+        INTO match_ledger_id
+      FROM public.ledger l
+      WHERE l.reason IN ('tip_in','rain_in','airdrop_in')
+        AND l.user_id <> r_ledger.user_id
+        AND ABS(l.delta_lites) = ABS(r_ledger.delta_lites)
+        AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes') AND (r_ledger.created_at + INTERVAL '5 minutes')
+        AND NOT EXISTS (
+          SELECT 1 FROM public.tips t
+           WHERE t.ledger_out_id = r_ledger.id OR t.ledger_in_id = l.id
+        )
+      ORDER BY l.id ASC
+      LIMIT 1;
+      IF match_ledger_id IS NULL THEN RETURN; END IF;
+
+      INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
+      SELECT r_ledger.user_id, l.user_id, ABS(r_ledger.delta_lites), LEAST(r_ledger.created_at, l.created_at), r_ledger.id, l.id
+      FROM public.ledger l
+      WHERE l.id = match_ledger_id
+      ON CONFLICT DO NOTHING;
+
+    ELSE
+      -- we inserted the 'in' first; look for a matching 'out'
+      SELECT l.id
+        INTO match_ledger_id
+      FROM public.ledger l
+      WHERE l.reason IN ('tip_out','rain_out','airdrop_out')
+        AND l.user_id <> r_ledger.user_id
+        AND ABS(l.delta_lites) = ABS(r_ledger.delta_lites)
+        AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes') AND (r_ledger.created_at + INTERVAL '5 minutes')
+        AND NOT EXISTS (
+          SELECT 1 FROM public.tips t
+           WHERE t.ledger_in_id = r_ledger.id OR t.ledger_out_id = l.id
+        )
+      ORDER BY l.id ASC
+      LIMIT 1;
+      IF match_ledger_id IS NULL THEN RETURN; END IF;
+
+      INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
+      SELECT l.user_id, r_ledger.user_id, ABS(r_ledger.delta_lites), LEAST(r_ledger.created_at, l.created_at), l.id, r_ledger.id
+      FROM public.ledger l
+      WHERE l.id = match_ledger_id
+      ON CONFLICT DO NOTHING;
+    END IF;
+  END $$;
+
+  -- helper overload to avoid signature errors from triggers
+  CREATE OR REPLACE FUNCTION public.tips_try_pair(p_ledger_id INTEGER)
+  RETURNS VOID
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    PERFORM public.tips_try_pair(p_ledger_id::BIGINT);
+  END $$;
+
+  -- trigger wrapper
+  CREATE OR REPLACE FUNCTION public.tips_trigger_fire()
+  RETURNS TRIGGER
+  LANGUAGE plpgsql
+  AS $$
+  BEGIN
+    PERFORM public.tips_try_pair(NEW.id::BIGINT);
+    RETURN NEW;
+  END $$;
+
+  -- trigger itself (create if missing)
+  DO $$
+  BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_trigger WHERE tgname = 'tips_after_insert'
+    ) THEN
+      CREATE TRIGGER tips_after_insert
+      AFTER INSERT ON public.ledger
+      FOR EACH ROW EXECUTE FUNCTION public.tips_trigger_fire();
+    END IF;
+  END $$;
+  `);
+
+  console.log("[bootstrap] trigger ready; posting deposits → ledger…");
+
+  // 3) Deposits → ledger (credit) idempotent
   await c.query(
     `
     INSERT INTO public.ledger(user_id, delta_lites, reason, ref, created_at)
@@ -63,7 +177,7 @@ async function main() {
 
   console.log("[bootstrap] deposits posted; posting withdrawals → ledger…");
 
-  // 3) Withdrawals → ledger (debit) idempotent
+  // 4) Withdrawals → ledger (debit) idempotent
   await c.query(`
     INSERT INTO public.ledger(user_id, delta_lites, reason, ref, created_at)
     SELECT w.user_id,
@@ -80,9 +194,9 @@ async function main() {
       );
   `);
 
-  console.log("[bootstrap] withdrawals posted; pairing tips…");
+  console.log("[bootstrap] withdrawals posted; pairing tips sweep…");
 
-  // 4) Pair tips from existing ledger rows (strict pairing, idempotent)
+  // 5) Pair any historical tip rows that arrived out-of-order (10-min window)
   await c.query(`
     WITH outs AS (
       SELECT id, user_id, delta_lites, created_at
@@ -102,8 +216,7 @@ async function main() {
      AND o.user_id <> i.user_id
      AND ABS(EXTRACT(EPOCH FROM (i.created_at - o.created_at))) <= 600
     WHERE NOT EXISTS (
-      SELECT 1
-      FROM public.tips t
+      SELECT 1 FROM public.tips t
       WHERE t.ledger_out_id = o.id OR t.ledger_in_id = i.id
     );
   `);
