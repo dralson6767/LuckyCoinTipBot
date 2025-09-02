@@ -8,6 +8,7 @@ import {
   balanceLites,
   transfer,
   findUserByUsername,
+  debit, // 👈 used for withdrawal ledger debit
 } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
@@ -72,8 +73,6 @@ const getBotUsername = () => (BOT_AT.startsWith("@") ? BOT_AT.slice(1) : "");
 
 // ---------- robust RPC helpers ----------
 type RpcErr = { code?: number; message?: string };
-const isLikelyMethodMissing = (e: any) =>
-  /Method not found/i.test(String(e?.message || e));
 const isWalletBusy = (e: any) =>
   /rescanning|loading wallet|loading block|resource busy|database is locked/i.test(
     String(e?.message || e)
@@ -215,6 +214,7 @@ bot.help(async (ctx) => {
   }
 });
 
+// ----- /deposit -----
 bot.command("deposit", async (ctx) => {
   console.log("[/deposit] start", ctx.from?.id, ctx.chat?.id);
   const user = await ensureUser(ctx.from);
@@ -247,6 +247,7 @@ bot.command("deposit", async (ctx) => {
   }
 });
 
+// ----- /balance -----
 bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
@@ -272,6 +273,7 @@ bot.command("balance", async (ctx) => {
   }
 });
 
+// ----- /tip -----
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
@@ -334,8 +336,7 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // Ensure recipient — pass the FULL replyTo object if we have it (so username updates)
-  // Otherwise, if tipping by @username, pass that username to refresh mapping.
+  // Ensure recipient — pass the FULL replyTo object if present (so username updates)
   const to = await ensureUser(
     replyTo
       ? replyTo
@@ -364,17 +365,14 @@ bot.command("tip", async (ctx) => {
     : `user ${to.id}`;
   let toDisplay = toDisplayFromReply || toDisplayFromDb;
 
-  // Heuristic: started if we have username in DB;
-  // If not, we'll attempt a DM — if it succeeds, treat as started.
+  // Heuristic: started if we have username in DB; try DM once to confirm
   let hasStarted = !!(to as any).username;
 
-  // Deep-link to start the bot (bots can’t DM first)
   const botUser = getBotUsername();
   const deepLink = botUser
     ? `https://t.me/${botUser}?start=claim-${Date.now()}`
     : "";
 
-  // DM text used if needed
   const tipper = fromName;
   const dmText = [
     `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
@@ -384,7 +382,6 @@ bot.command("tip", async (ctx) => {
   if (isGroup(ctx)) {
     await tryDelete(ctx);
 
-    // If we think they haven't started, try a DM once. If it works, flip the flag.
     if (!hasStarted) {
       const dmOk = await dmUser(
         ctx,
@@ -413,7 +410,6 @@ bot.command("tip", async (ctx) => {
     }
     await ctx.reply(lines.join("\n"), extra);
   } else {
-    // DM context
     await ctx.reply(`Sent ${pretty} LKY to ${toDisplay}`);
     if (!hasStarted && deepLink) {
       await dmUser(
@@ -425,6 +421,153 @@ bot.command("tip", async (ctx) => {
     }
   }
   console.log("[/tip] ok");
+});
+
+// ----- /withdraw -----
+// Usage: /withdraw <address> <amount>
+bot.command("withdraw", async (ctx) => {
+  console.log("[/withdraw] start");
+  const sender = await ensureUser(ctx.from);
+
+  const text = ctx.message?.text || "";
+  const parts = text.trim().split(/\s+/);
+  parts.shift(); // remove '/withdraw'
+
+  if (parts.length < 2) {
+    const msg = "Usage: /withdraw <address> <amount>";
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg);
+    }
+    return;
+  }
+
+  const toAddress = parts[0];
+  let amount: bigint;
+  try {
+    amount = parseLkyToLites(parts[1]);
+  } catch (e: any) {
+    const msg = `Invalid amount: ${e.message}`;
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg);
+    }
+    return;
+  }
+  if (!isValidTipAmount(amount)) {
+    const msg = "Amount too small.";
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg);
+    }
+    return;
+  }
+
+  // Check balance
+  const bal = await balanceLites(sender.id);
+  if (bal < amount) {
+    const msg = `Insufficient balance. You have ${formatLky(
+      bal,
+      decimals
+    )} LKY.`;
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg);
+    }
+    return;
+  }
+
+  // Validate address (best-effort; if node lacks the method, continue)
+  const v = await rpcTry<any>("validateaddress", [toAddress], 5000);
+  if (v.ok && v.value && v.value.isvalid === false) {
+    const msg = "Invalid address.";
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg);
+    }
+    return;
+  }
+
+  // Send on-chain (LuckyCoin nodes expect amount in LKY float)
+  const amtStr = formatLky(amount, 8); // "1.23456789"
+  const send = await rpcTry<string>(
+    "sendtoaddress",
+    [toAddress, Number(amtStr)],
+    15000
+  );
+
+  if (!send.ok) {
+    const errStr = String(send.err?.message || send.err || "unknown error");
+    console.error("[/withdraw] RPC ERR:", errStr);
+
+    const msg = isWalletBusy(send.err)
+      ? "Wallet is busy. Try /withdraw again in a minute."
+      : /invalid|address/i.test(errStr)
+      ? "Invalid address."
+      : /insufficient|fund/i.test(errStr)
+      ? "Node wallet has insufficient funds."
+      : `Withdraw failed: ${errStr}`;
+
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    } else {
+      await ctx.reply(msg);
+    }
+    return;
+  }
+
+  const txid = send.value;
+
+  // Record withdrawal row + debit ledger (idempotent via UNIQUE + our ledger constraint)
+  try {
+    await query(
+      `INSERT INTO public.withdrawals (user_id, to_address, amount_lites, txid, status, created_at)
+       VALUES ($1,$2,$3,$4,'sent', NOW())
+       ON CONFLICT (txid) DO NOTHING`,
+      [sender.id, toAddress, amount.toString(), txid]
+    );
+  } catch (e: any) {
+    console.error("[/withdraw] insert withdrawals ERR:", e?.message || e);
+  }
+
+  try {
+    await debit(sender.id, amount, "withdrawal", txid);
+  } catch (e: any) {
+    console.error("[/withdraw] debit ledger ERR:", e?.message || e);
+  }
+
+  const okMsg = `Withdrawal sent.\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nTXID: \`${txid}\``;
+  if (isGroup(ctx)) {
+    await tryDelete(ctx);
+    await dm(ctx, okMsg, { parse_mode: "Markdown" });
+  } else {
+    await ctx.reply(okMsg, { parse_mode: "Markdown" });
+  }
+
+  console.log("[/withdraw] ok", txid);
 });
 
 // ---------- error & launch ----------
