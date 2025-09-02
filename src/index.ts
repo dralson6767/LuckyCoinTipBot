@@ -49,7 +49,7 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
   }
 };
 
-// DM a specific Telegram user id (not necessarily ctx.from)
+// DM a specific user id
 const dmUser = async (
   ctx: any,
   tgUserId: number,
@@ -115,9 +115,7 @@ async function getFastDepositAddress(
          ON CONFLICT (address) DO NOTHING`,
         [userId, addr, label]
       );
-    } catch (e) {
-      // ignore — address still returned
-    }
+    } catch {}
     return addr;
   };
 
@@ -131,7 +129,7 @@ async function getFastDepositAddress(
     if (r.ok) {
       const existing = Object.keys(r.value || {})[0];
       if (existing) return remember(existing);
-    } // else ignore "Method not found" and continue
+    }
   }
 
   // 2) Legacy: list addresses by account
@@ -148,20 +146,17 @@ async function getFastDepositAddress(
     if (r.ok && r.value) return remember(r.value);
   }
 
-  // 4) Fallback: mint new address for this label — with a quick retry if wallet is “busy”
+  // 4) Fallback: mint new address (retry once if busy)
   {
     const attempt = async () => rpcTry<string>("getnewaddress", [label], 8000);
-
     let r = await attempt();
     if (!r.ok && isWalletBusy(r.err)) {
-      // quick retry once after short sleep
       await new Promise((res) => setTimeout(res, 800));
       r = await attempt();
     }
     if (r.ok && r.value) return remember(r.value);
   }
 
-  // If every path failed, return a deterministic error up-stack (caller decides message)
   throw new Error("DEPOSIT_ADDR_FAILED");
 }
 
@@ -237,7 +232,6 @@ bot.command("deposit", async (ctx) => {
     console.log("[/deposit] ok");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
-    // Friendlier, precise messaging
     const msg =
       isWalletBusy(e) || /DEPOSIT_ADDR_FAILED/.test(String(e))
         ? "Wallet is busy. Try /deposit again in a minute."
@@ -280,24 +274,28 @@ bot.command("balance", async (ctx) => {
 
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
-  await ensureUser(ctx.from);
+
+  // Ensure sender is up-to-date (captures username changes on every tip)
+  const from = await ensureUser(ctx.from);
 
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
   parts.shift();
 
-  // Full Telegram "recipient" user object if we have a reply
+  // Full Telegram "recipient" if we have a reply
   const replyTo =
     "reply_to_message" in ctx.message
       ? ctx.message.reply_to_message?.from
       : undefined;
 
   let targetUserId: number | null = null;
+  let targetUsernameFromCmd: string | null = null;
+
   if (replyTo?.id) {
     targetUserId = replyTo.id;
   } else if (parts.length >= 2 && parts[0].startsWith("@")) {
-    const uname = parts[0].slice(1);
-    const target = await findUserByUsername(uname);
+    targetUsernameFromCmd = parts[0].slice(1);
+    const target = await findUserByUsername(targetUsernameFromCmd);
     if (target) targetUserId = Number(target.tg_user_id);
   }
 
@@ -336,9 +334,15 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  const from = await ensureUser(ctx.from);
-  const to = await ensureUser({ id: targetUserId });
+  // Ensure recipient — pass the FULL replyTo object if we have it (so username updates)
+  // Otherwise, if tipping by @username, pass that username to refresh mapping.
+  const to = await ensureUser(
+    replyTo
+      ? replyTo
+      : { id: targetUserId, username: targetUsernameFromCmd || undefined }
+  );
 
+  // Execute transfer
   try {
     await transfer(from.id, to.id, amount);
   } catch (e: any) {
@@ -358,66 +362,60 @@ bot.command("tip", async (ctx) => {
   const toDisplayFromDb = (to as any).username
     ? `@${(to as any).username}`
     : `user ${to.id}`;
-  const toDisplay = toDisplayFromReply || toDisplayFromDb;
+  let toDisplay = toDisplayFromReply || toDisplayFromDb;
 
-  // "Has started" heuristic: we only know they've started if we have a username stored
-  const hasStarted = !!(to as any).username;
+  // Heuristic: started if we have username in DB;
+  // If not, we'll attempt a DM — if it succeeds, treat as started.
+  let hasStarted = !!(to as any).username;
 
-  // Deep-link to start the bot (bots cannot DM first)
+  // Deep-link to start the bot (bots can’t DM first)
   const botUser = getBotUsername();
   const deepLink = botUser
     ? `https://t.me/${botUser}?start=claim-${Date.now()}`
     : "";
 
+  // DM text used if needed
+  const tipper = fromName;
+  const dmText = [
+    `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
+    `Tap “Start” to activate your wallet and claim it.`,
+  ].join("\n");
+
   if (isGroup(ctx)) {
     await tryDelete(ctx);
+
+    // If we think they haven't started, try a DM once. If it works, flip the flag.
+    if (!hasStarted) {
+      const dmOk = await dmUser(
+        ctx,
+        replyTo?.id ?? to.id,
+        dmText,
+        deepLink
+          ? Markup.inlineKeyboard([
+              [Markup.button.url("Start the bot", deepLink)],
+            ])
+          : undefined
+      );
+      if (dmOk) hasStarted = true;
+    }
 
     const lines = [
       `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
       `HODL LuckyCoin for eternal good luck! 🍀`,
     ];
-    if (!hasStarted) {
-      lines.push(`🤖 Recipient must *Start* the bot to receive the DM.`);
-    }
 
     const extra: any = { parse_mode: "Markdown" };
     if (!hasStarted && deepLink) {
+      lines.push(`🤖 Recipient must *Start* the bot to receive the DM.`);
       extra.reply_markup = Markup.inlineKeyboard([
         [Markup.button.url("Start bot to claim", deepLink)],
       ]);
     }
     await ctx.reply(lines.join("\n"), extra);
-
-    // Try a DM anyway; will fail (403) if they haven't started — we swallow it.
-    if (!hasStarted) {
-      const tipper = fromName;
-      const dmText = [
-        `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
-        `Tap “Start” to activate your wallet and claim it.`,
-      ].join("\n");
-      const targetIdForDm = replyTo?.id ?? to.id;
-      if (deepLink) {
-        await dmUser(
-          ctx,
-          targetIdForDm,
-          dmText,
-          Markup.inlineKeyboard([
-            [Markup.button.url("Start the bot", deepLink)],
-          ])
-        );
-      } else {
-        await dmUser(ctx, targetIdForDm, dmText);
-      }
-    }
   } else {
     // DM context
     await ctx.reply(`Sent ${pretty} LKY to ${toDisplay}`);
     if (!hasStarted && deepLink) {
-      const tipper = fromName;
-      const dmText = [
-        `🎉 You’ve been tipped ${pretty} LKY by ${tipper}.`,
-        `Tap “Start” to activate your wallet and claim it.`,
-      ].join("\n");
       await dmUser(
         ctx,
         replyTo?.id ?? to.id,
