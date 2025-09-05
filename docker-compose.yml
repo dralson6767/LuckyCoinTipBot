@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:16
@@ -15,8 +17,10 @@ services:
       timeout: 3s
       retries: 30
     volumes:
-      # Logical alias → pinned to the GOOD physical volume below
+      # Logical alias → pinned to the GOOD physical volume below.
+      # DO NOT change the name unless you’ve verified with `docker inspect` first.
       - tipbot_data:/var/lib/postgresql/data
+      # Safe to keep; only applies on first bootstrap of a truly empty volume.
       - ./sql:/docker-entrypoint-initdb.d:ro
 
   bot:
@@ -24,10 +28,15 @@ services:
     container_name: tipbot-bot
     restart: unless-stopped
     env_file: .env
+    environment:
+      # Force libpq defaults the app needs even if the DB were read-only:
+      #  - search_path=public ensures queries hit the right schema
+      #  - default_transaction_read_only=off prevents accidental RO sessions
+      PGOPTIONS: -c search_path=public -c default_transaction_read_only=off
     depends_on:
       postgres:
         condition: service_healthy
-    # ensure we run the npm script
+    # ensure npm script is used (keeps parity with local dev)
     command: ["npm", "run", "start:bot"]
 
   worker:
@@ -35,14 +44,17 @@ services:
     container_name: tipbot-worker
     restart: unless-stopped
     env_file: .env
+    environment:
+      PGOPTIONS: -c search_path=public -c default_transaction_read_only=off
     depends_on:
       postgres:
         condition: service_healthy
-    # bootstrap runs first on every start, then the worker
+    # worker bootstraps on every start (safe/idempotent)
     command: ["npm", "run", "start:worker"]
 
 volumes:
   tipbot_data:
     external: true
-    # bind the logical volume to the canonical GOOD volume on the VPS
+    # Bind the logical volume to the canonical GOOD volume on the VPS.
+    # Verify this volume exists before bringing the stack up.
     name: tipbot_pg_sql_2025_08_31_031701
