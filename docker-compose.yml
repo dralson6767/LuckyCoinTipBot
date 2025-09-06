@@ -1,4 +1,4 @@
-# docker-compose.yml  (clean & hardened — no version key needed)
+# docker-compose.yml (clean & hardened — no "version" key)
 
 services:
   postgres:
@@ -27,37 +27,37 @@ services:
       driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
 
-  # One-shot guard that proves we're on a non-empty DB (users>=1 AND ledger>=1).
-  # It stays up (sleep infinity) and flips to "healthy" when the checks pass.
+  # Proves the DB is non-empty before starting app services.
   db-guard:
     image: postgres:16
     container_name: tipbot-db-guard
     restart: unless-stopped
     env_file: .env
     environment:
-      # Needed so psql from this container can auth to the postgres service
       PGPASSWORD: postgres
       TZ: UTC
     depends_on:
       postgres:
         condition: service_healthy
-    command: >
-      bash -lc '
-      set -euo pipefail;
-      DB="${DATABASE_URL##*/}";
-      echo "[db-guard] Checking DB: $DB";
-      for i in {1..90}; do
-        if psql -h postgres -U postgres -d "$DB" -tAc "SELECT 1" >/dev/null 2>&1; then
-          USERS=$(psql -h postgres -U postgres -d "$DB" -tAc "SELECT COUNT(*) FROM users" || echo 0);
-          LEDGER=$(psql -h postgres -U postgres -d "$DB" -tAc "SELECT COUNT(*) FROM ledger" || echo 0);
-          echo "[db-guard] users=$USERS ledger=$LEDGER";
-          if [ "${USERS:-0}" -ge 1 ] && [ "${LEDGER:-0}" -ge 1 ]; then
-            echo "[db-guard] OK"; touch /tmp/healthy; break;
-          fi
-        fi
-        echo "[db-guard] not ready, retry=$i"; sleep 2;
-      done;
-      exec tail -f /dev/null'
+    command:
+      - /bin/sh
+      - -lc
+      - >
+        set -euo pipefail;
+        DB="$${DATABASE_URL##*/}";
+        echo "[db-guard] Checking DB: $$DB";
+        for i in $$(seq 1 90); do
+          if psql -h postgres -U postgres -d "$$DB" -tAc "SELECT 1" >/dev/null 2>&1; then
+            USERS=$$(psql -h postgres -U postgres -d "$$DB" -tAc "SELECT COUNT(*) FROM users" || echo 0);
+            LEDGER=$$(psql -h postgres -U postgres -d "$$DB" -tAc "SELECT COUNT(*) FROM ledger" || echo 0);
+            echo "[db-guard] users=$$USERS ledger=$$LEDGER";
+            if [ "$$USERS" -ge 1 ] && [ "$$LEDGER" -ge 1 ]; then
+              echo "[db-guard] OK"; touch /tmp/healthy; break;
+            fi
+          fi;
+          echo "[db-guard] not ready, retry=$$i"; sleep 2;
+        done;
+        exec tail -f /dev/null
     healthcheck:
       test: ["CMD-SHELL", "test -f /tmp/healthy"]
       interval: 5s
