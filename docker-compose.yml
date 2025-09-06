@@ -1,5 +1,4 @@
-version: "3.9"
-
+# docker-compose.yml  (clean & hardened)
 services:
   postgres:
     image: postgres:16
@@ -12,16 +11,20 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d tipbot"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U postgres -d tipbot_restore_2025_09_06 || pg_isready -U postgres -d tipbot",
+        ]
       interval: 5s
       timeout: 3s
       retries: 30
     volumes:
-      # Logical alias → pinned to the GOOD physical volume below.
-      # DO NOT change the name unless you’ve verified with `docker inspect` first.
       - tipbot_data:/var/lib/postgresql/data
-      # Safe to keep; only applies on first bootstrap of a truly empty volume.
       - ./sql:/docker-entrypoint-initdb.d:ro
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "5" }
 
   bot:
     build: .
@@ -29,15 +32,24 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # Force libpq defaults the app needs even if the DB were read-only:
-      #  - search_path=public ensures queries hit the right schema
-      #  - default_transaction_read_only=off prevents accidental RO sessions
-      PGOPTIONS: -c search_path=public -c default_transaction_read_only=off
+      # Per-session safety valves at the server side even if app code forgets:
+      PGOPTIONS: >-
+        -c search_path=public
+        -c default_transaction_read_only=off
+        -c statement_timeout=15s
+        -c lock_timeout=3s
+        -c idle_in_transaction_session_timeout=10s
+        -c client_min_messages=warning
+      TZ: UTC
     depends_on:
       postgres:
         condition: service_healthy
-    # ensure npm script is used (keeps parity with local dev)
-    command: ["npm", "run", "start:bot"]
+    init: true
+    # Guard before starting the bot
+    command: ["/bin/sh", "-lc", "./scripts/guard_db.sh && npm run start:bot"]
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "5" }
 
   worker:
     build: .
@@ -45,16 +57,25 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      PGOPTIONS: -c search_path=public -c default_transaction_read_only=off
+      PGOPTIONS: >-
+        -c search_path=public
+        -c default_transaction_read_only=off
+        -c statement_timeout=15s
+        -c lock_timeout=3s
+        -c idle_in_transaction_session_timeout=10s
+        -c client_min_messages=warning
+      TZ: UTC
     depends_on:
       postgres:
         condition: service_healthy
-    # worker bootstraps on every start (safe/idempotent)
-    command: ["npm", "run", "start:worker"]
+    init: true
+    # Bootstrap logic is in the worker; guard first anyway
+    command: ["/bin/sh", "-lc", "./scripts/guard_db.sh && npm run start:worker"]
+    logging:
+      driver: "json-file"
+      options: { max-size: "10m", max-file: "5" }
 
 volumes:
   tipbot_data:
     external: true
-    # Bind the logical volume to the canonical GOOD volume on the VPS.
-    # Verify this volume exists before bringing the stack up.
     name: tipbot_pg_sql_2025_08_31_031701
