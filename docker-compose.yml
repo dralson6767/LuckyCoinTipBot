@@ -1,9 +1,9 @@
-version: "3.9"
+# docker-compose.yml
 
 services:
-  # Hard gate: refuse to let Postgres start if the data dir is empty or swapped.
+  # Refuse to let Postgres start if the data dir is empty or swapped.
   data-sentinel:
-    image: postgres:16 # contains pg_controldata for system-identifier check
+    image: postgres:16 # has pg_controldata for system-identifier check
     container_name: tipbot-data-sentinel
     restart: unless-stopped
     volumes:
@@ -14,24 +14,22 @@ services:
       - >
         set -euo pipefail;
         D=/var/lib/postgresql/data;
-        if [ ! -s "$D/PG_VERSION" ]; then
-          echo "[sentinel] FATAL: $D is empty (PG_VERSION missing). Refusing init.";
-          exit 42;
+        if [ ! -s "$$D/PG_VERSION" ]; then
+          echo "[sentinel] FATAL: $$D is empty (PG_VERSION missing). Refusing init."; exit 42;
         fi;
-        SYSID_FILE="$D/TIPBOT_SYSID";
-        CUR=$(/usr/lib/postgresql/16/bin/pg_controldata "$D" | awk -F': *' '/Database system identifier/{print $2}');
-        if [ -s "$SYSID_FILE" ]; then
-          OLD=$(cat "$SYSID_FILE");
-          if [ "$OLD" != "$CUR" ]; then
-            echo "[sentinel] FATAL: system identifier changed ($OLD -> $CUR). Refusing start.";
-            exit 43;
-          fi;
+        SYSID_FILE="$$D/TIPBOT_SYSID";
+        CUR=$$(/usr/lib/postgresql/16/bin/pg_controldata "$$D" | awk -F': *' '/Database system identifier/{print $$2}');
+        if [ -s "$$SYSID_FILE" ]; then
+          OLD=$$(cat "$$SYSID_FILE");
+          if [ "$$OLD" != "$$CUR" ]; then
+            echo "[sentinel] FATAL: system identifier changed ($$OLD -> $$CUR). Refusing start."; exit 43;
+          fi
         else
-          echo "$CUR" > "$SYSID_FILE";
-        fi;
-        touch "$D/TIPBOT_SAFEGUARD";
+          echo "$$CUR" > "$$SYSID_FILE";
+        fi
+        touch "$$D/TIPBOT_SAFEGUARD";
         echo "[sentinel] OK: cluster present & id verified.";
-        exit 0
+        exec tail -f /dev/null
     healthcheck:
       test:
         [
