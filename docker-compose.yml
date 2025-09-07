@@ -1,9 +1,9 @@
-# docker-compose.yml
+# docker-compose.yml (hardened, fail-closed)
 
 services:
-  # Refuse to let Postgres start if the data dir is empty or swapped.
+  # Hard gate: refuse to let Postgres start if the data dir is empty or swapped.
   data-sentinel:
-    image: postgres:16 # has pg_controldata for system-identifier check
+    image: postgres:16 # includes pg_controldata
     container_name: tipbot-data-sentinel
     restart: unless-stopped
     volumes:
@@ -13,29 +13,27 @@ services:
       - -lc
       - >
         set -euo pipefail;
-        D=/var/lib/postgresql/data;
+        D=/var/lib/postgresql/data; READY=/tmp/healthy;
         if [ ! -s "$$D/PG_VERSION" ]; then
           echo "[sentinel] FATAL: $$D is empty (PG_VERSION missing). Refusing init."; exit 42;
         fi;
+        PGC=$$(command -v pg_controldata || echo /usr/lib/postgresql/16/bin/pg_controldata);
         SYSID_FILE="$$D/TIPBOT_SYSID";
-        CUR=$$(/usr/lib/postgresql/16/bin/pg_controldata "$$D" | awk -F': *' '/Database system identifier/{print $$2}');
+        CUR=$$($$PGC "$$D" | awk -F': *' '/Database system identifier/{print $$2}');
         if [ -s "$$SYSID_FILE" ]; then
           OLD=$$(cat "$$SYSID_FILE");
           if [ "$$OLD" != "$$CUR" ]; then
             echo "[sentinel] FATAL: system identifier changed ($$OLD -> $$CUR). Refusing start."; exit 43;
-          fi
+          fi;
         else
           echo "$$CUR" > "$$SYSID_FILE";
-        fi
+        fi;
         touch "$$D/TIPBOT_SAFEGUARD";
+        touch "$$READY";
         echo "[sentinel] OK: cluster present & id verified.";
         exec tail -f /dev/null
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "test -s /var/lib/postgresql/data/PG_VERSION -a -s /var/lib/postgresql/data/TIPBOT_SYSID -a -f /var/lib/postgresql/data/TIPBOT_SAFEGUARD",
-        ]
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
       interval: 5s
       timeout: 3s
       retries: 30
@@ -123,14 +121,11 @@ services:
         -c client_min_messages=warning
       TZ: UTC
     depends_on:
-      postgres:
-        condition: service_healthy
-      db-guard:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
+      db-guard: { condition: service_healthy }
     init: true
     command: ["npm", "run", "start:bot"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    extra_hosts: ["host.docker.internal:host-gateway"]
     logging:
       driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
@@ -150,14 +145,11 @@ services:
         -c client_min_messages=warning
       TZ: UTC
     depends_on:
-      postgres:
-        condition: service_healthy
-      db-guard:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
+      db-guard: { condition: service_healthy }
     init: true
     command: ["npm", "run", "start:worker"]
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    extra_hosts: ["host.docker.internal:host-gateway"]
     logging:
       driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
