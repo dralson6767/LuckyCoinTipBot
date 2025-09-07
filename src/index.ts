@@ -3,13 +3,8 @@ import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import { rpc } from "./rpc.js";
 import { query } from "./db.js";
-import {
-  ensureUser,
-  balanceLites,
-  transfer,
-  findUserByUsername,
-  debit,
-} from "./ledger.js";
+import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
+import { getUserBalanceLites } from "./balance.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
 // ---------- bot init ----------
@@ -262,7 +257,7 @@ bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await balanceLites(user.id);
+    const bal = await getUserBalanceLites(user.id);
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       await tryDelete(ctx);
@@ -498,7 +493,7 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  const bal = await balanceLites(sender.id);
+  const bal = await getUserBalanceLites(sender.id);
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
       bal,
