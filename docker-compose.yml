@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   postgres:
     image: postgres:16
@@ -7,6 +9,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: tipbot
+      TZ: UTC
     ports:
       - "5432:5432"
     healthcheck:
@@ -21,7 +24,7 @@ services:
       driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
 
-  # Proves the DB is non-empty before starting app services.
+  # Guards against starting the app on an empty/fresh DB.
   db-guard:
     image: postgres:16
     container_name: tipbot-db-guard
@@ -44,8 +47,9 @@ services:
           if psql -h postgres -U postgres -d "$$DB" -tAc "SELECT 1" >/dev/null 2>&1; then
             USERS=$$(psql -h postgres -U postgres -d "$$DB" -tAc "SELECT COUNT(*) FROM users" || echo 0);
             LEDGER=$$(psql -h postgres -U postgres -d "$$DB" -tAc "SELECT COUNT(*) FROM ledger" || echo 0);
-            echo "[db-guard] users=$$USERS ledger=$$LEDGER";
-            if [ "$$USERS" -ge 1 ] && [ "$$LEDGER" -ge 1 ]; then
+            HAS_TIPS=$$(psql -h postgres -U postgres -d "$$DB" -tAc "SELECT COUNT(*) FROM ledger WHERE reason IN ('tip_in','tip_out')" || echo 0);
+            echo "[db-guard] users=$$USERS ledger=$$LEDGER has_tips=$$HAS_TIPS";
+            if [ "$$HAS_TIPS" -ge 1 ]; then
               echo "[db-guard] OK"; touch /tmp/healthy; break;
             fi
           fi;
