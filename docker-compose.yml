@@ -1,4 +1,4 @@
-# docker-compose.yml (hardened, fail-closed)
+# docker-compose.yml (hardened, fail-closed, worker debug wrapper)
 
 services:
   # Hard gate: refuse to let Postgres start if the data dir is empty or swapped.
@@ -157,7 +157,19 @@ services:
       postgres: { condition: service_healthy }
       db-guard: { condition: service_healthy }
     init: true
-    command: ["npm", "run", "start:worker"]
+    # DEBUG WRAPPER: keep the worker alive and show full traces if it exits
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        node dist/src/bootstrap.js || true
+        echo "[wrapper] starting worker loop with traces…"
+        while true; do
+          node --trace-uncaught --trace-warnings dist/src/worker.js || true
+          echo "[wrapper] worker exited with code $$? — restarting in 5s"
+          sleep 5
+        done
     extra_hosts: ["host.docker.internal:host-gateway"]
     logging:
       driver: "json-file"
