@@ -1,9 +1,9 @@
-# docker-compose.yml (hardened, fail-closed, worker debug wrapper)
+# docker-compose.yml (hardened, fail-closed, RPC-gated)
 
 services:
   # Hard gate: refuse to let Postgres start if the data dir is empty or swapped.
   data-sentinel:
-    image: postgres:16 # includes pg_controldata
+    image: postgres:16
     container_name: tipbot-data-sentinel
     restart: unless-stopped
     volumes:
@@ -61,11 +61,50 @@ services:
       timeout: 3s
       retries: 30
     volumes:
-      # NOTE: init SQL mount REMOVED to prevent empty schema creation on a fresh dir.
       - tipbot_data:/var/lib/postgresql/data
     logging:
       driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
+
+  # RPC gate: ensures LuckyCoin node RPC is reachable before app starts.
+  rpc-guard:
+    image: alpine:3.20
+    container_name: tipbot-rpc-guard
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      # Your node is listening on 172.18.0.1:9918; pin this mapping explicitly.
+      - host.docker.internal:172.18.0.1
+    command:
+      - /bin/sh
+      - -lc
+      - |
+        set -euo pipefail
+        apk add --no-cache curl jq >/dev/null
+        echo "[rpc-guard] waiting for RPC at $LKY_RPC_URL ..."
+        for i in $(seq 1 90); do
+          OUT=$(curl -s --user "$LKY_RPC_USER:$LKY_RPC_PASS" -H 'content-type: text/plain' \
+            --data-binary '{"jsonrpc":"1.0","id":"ping","method":"getblockchaininfo","params":[]}' \
+            "$LKY_RPC_URL" || true)
+          ERR=$(echo "$OUT" | jq -r '.error // empty')
+          BLK=$(echo "$OUT" | jq -r '.result.blocks // empty')
+          if [ -z "$ERR" ] && [ -n "$BLK" ] && [ "$BLK" -ge 0 ] 2>/dev/null; then
+            echo "[rpc-guard] OK: blocks=$BLK"
+            touch /tmp/healthy
+            exec tail -f /dev/null
+          fi
+          echo "[rpc-guard] not ready ($i) err=${ERR:-none}; retrying..."
+          sleep 2
+        done
+        echo "[rpc-guard] FATAL: RPC not reachable"; exit 42
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: "json-file"
+      options: { max-size: "1m", max-file: "2" }
 
   # Blocks the app unless the DB is the intended one (core tables exist) AND has data.
   db-guard:
@@ -132,9 +171,11 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       db-guard: { condition: service_healthy }
+      rpc-guard: { condition: service_healthy }
     init: true
     command: ["npm", "run", "start:bot"]
-    extra_hosts: ["host.docker.internal:host-gateway"]
+    extra_hosts:
+      - host.docker.internal:172.18.0.1
     logging:
       driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
@@ -156,21 +197,11 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       db-guard: { condition: service_healthy }
+      rpc-guard: { condition: service_healthy }
     init: true
-    # DEBUG WRAPPER: keep the worker alive and show full traces if it exits
-    command:
-      - sh
-      - -lc
-      - |
-        set -e
-        node dist/src/bootstrap.js || true
-        echo "[wrapper] starting worker loop with traces…"
-        while true; do
-          node --trace-uncaught --trace-warnings dist/src/worker.js || true
-          echo "[wrapper] worker exited with code $$? — restarting in 5s"
-          sleep 5
-        done
-    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: ["npm", "run", "start:worker"]
+    extra_hosts:
+      - host.docker.internal:172.18.0.1
     logging:
       driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
