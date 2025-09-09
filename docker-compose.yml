@@ -75,6 +75,7 @@ services:
     env_file: .env
     environment:
       TZ: UTC
+      PGCONNECT_TIMEOUT: "5"
     depends_on:
       postgres:
         condition: service_healthy
@@ -88,7 +89,7 @@ services:
         for i in $$(seq 1 90); do
           if psql "$$DATABASE_URL" -tAc "SELECT 1" >/dev/null 2>&1; then
             SQL="SELECT
-                   (SELECT to_regclass('public.users') IS NOT NULL) AS has_users,
+                   (SELECT to_regclass('public.users')  IS NOT NULL) AS has_users,
                    (SELECT to_regclass('public.ledger') IS NOT NULL) AS has_ledger,
                    (SELECT to_regclass('public.tips')   IS NOT NULL) AS has_tips_tbl,
                    (SELECT COUNT(*) FROM public.users)  AS users_cnt";
