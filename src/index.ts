@@ -67,12 +67,17 @@ const getBotUsername = () => (BOT_AT.startsWith("@") ? BOT_AT.slice(1) : "");
 
 // ---------- RPC helpers ----------
 type RpcErr = { code?: number; message?: string };
-const isWalletBusy = (e: any) =>
-  /rescanning|loading wallet|loading block|resource busy|database is locked/i.test(
-    String(e?.message || e)
-  ) ||
-  e?.code === -4 ||
-  e?.code === -28;
+
+const isWalletBusy = (e: any) => {
+  const msg = String(e?.message || e || "");
+  return (
+    /rescanning|loading wallet|loading block|resource busy|database is locked|rewinding blocks|reindex/i.test(
+      msg
+    ) ||
+    e?.code === -4 ||
+    e?.code === -28
+  );
+};
 
 async function rpcTry<T>(
   method: string,
@@ -87,19 +92,23 @@ async function rpcTry<T>(
   }
 }
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 // ---------- /deposit address fast path ----------
 async function getFastDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
-  // reuse from DB
+  // 0) reuse last address from DB if any
   const prev = await query<{ address: string }>(
     "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [userId]
   );
   if (prev.rows[0]?.address) return prev.rows[0].address;
 
+  // label/account we try to use across RPC variants
   const label = String(tgUserId);
+
   const remember = async (addr: string) => {
     try {
       await query(
@@ -112,40 +121,50 @@ async function getFastDepositAddress(
     return addr;
   };
 
-  // labels
+  // 1) Modern label map (if supported)
   {
     const r = await rpcTry<Record<string, unknown>>(
       "getaddressesbylabel",
       [label],
       4000
     );
-    if (r.ok) {
+    if (r.ok && r.value) {
       const existing = Object.keys(r.value || {})[0];
       if (existing) return remember(existing);
     }
   }
-  // legacy list
+
+  // 2) Legacy: list by account (if supported)
   {
     const r = await rpcTry<string[]>("getaddressesbyaccount", [label], 4000);
     if (r.ok && Array.isArray(r.value) && r.value[0])
       return remember(r.value[0]);
   }
-  // legacy default
+
+  // 3) Legacy: single current address for account (if supported)
   {
     const r = await rpcTry<string>("getaccountaddress", [label], 6000);
     if (r.ok && r.value) return remember(r.value);
   }
-  // mint new (retry once if busy)
+
+  // 4) Mint new (1-arg legacy “account” form)
   {
-    const attempt = async () => rpcTry<string>("getnewaddress", [label], 8000);
+    const attempt = async () => rpcTry<string>("getnewaddress", [label], 8000); // NO "legacy" second arg
     let r = await attempt();
     if (!r.ok && isWalletBusy(r.err)) {
-      await new Promise((res) => setTimeout(res, 800));
+      await sleep(800);
       r = await attempt();
     }
     if (r.ok && r.value) return remember(r.value);
   }
 
+  // 5) Ultra-legacy: zero-arg (default account)
+  {
+    const r = await rpcTry<string>("getnewaddress", [], 6000);
+    if (r.ok && r.value) return remember(r.value);
+  }
+
+  // If we got here, all variants failed on this node right now.
   throw new Error("DEPOSIT_ADDR_FAILED");
 }
 
@@ -234,13 +253,15 @@ bot.command("deposit", async (ctx) => {
     } else {
       await ctx.reply(msg, { parse_mode: "Markdown" });
     }
-    console.log("[/deposit] ok]");
+    console.log("[/deposit] ok");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
-    const msg =
-      isWalletBusy(e) || /DEPOSIT_ADDR_FAILED/.test(String(e))
-        ? "Wallet is busy. Try /deposit again in a minute."
-        : "Wallet temporarily unavailable. Try /deposit again shortly.";
+
+    // Only call it "busy" when it actually is. Otherwise use a generic message.
+    const msg = isWalletBusy(e)
+      ? "Wallet is busy. Try /deposit again in a minute."
+      : "Wallet temporarily unavailable. Try /deposit again shortly.";
+
     if (isGroup(ctx)) {
       await tryDelete(ctx);
       const ok = await dm(ctx, msg);
