@@ -1,4 +1,4 @@
-# docker-compose.yml (add RPC readiness guard so bot/worker only start after the node is actually ready)
+version: "3"
 
 services:
   data-sentinel:
@@ -125,7 +125,9 @@ services:
       driver: json-file
       options: { max-size: "2m", max-file: "3" }
 
-  # NEW: Guard that waits until the node finishes "Loading block index..." and is fully usable.
+  # Guard that waits for the node. MODE:
+  #   lenient (default): healthy on any JSON reply (OK or -28 Loading block index)
+  #   ready: healthy only when IBD=false (fully synced)
   rpc-guard:
     image: alpine:3.20
     container_name: tipbot-rpc-guard
@@ -135,6 +137,7 @@ services:
       LKY_RPC_URL: http://rpc-proxy:9918
       NODE_RPC_URL: http://rpc-proxy:9918
       RPC_URL: http://rpc-proxy:9918
+      RPC_GUARD_MODE: ${RPC_GUARD_MODE:-lenient}
       TZ: UTC
     depends_on:
       rpc-proxy:
@@ -148,22 +151,30 @@ services:
         apk add --no-cache curl jq >/dev/null 2>&1 || true;
         URL="$${LKY_RPC_URL:-http://rpc-proxy:9918}";
         USERPASS="$${LKY_RPC_USER:-}:$${LKY_RPC_PASS:-}";
-        echo "[rpc-guard] waiting for node at $$URL";
-        for n in $$(seq 1 600); do
+        MODE="$${RPC_GUARD_MODE:-lenient}";
+        echo "[rpc-guard] waiting for node at $$URL (mode=$$MODE)";
+        for n in $$(seq 1 1800); do
           OUT=$$(curl -sS --user "$$USERPASS" -H "content-type: application/json" \
                  --data '{"jsonrpc":"1.0","id":"ping","method":"getblockchaininfo","params":[]}' "$$URL" || true);
           ERR_CODE=$$(echo "$$OUT" | jq -r '.error.code // empty');
           IBD=$$(echo "$$OUT" | jq -r '.result.initialblockdownload // empty');
-          if [ "$$ERR_CODE" = "-28" ]; then
-            echo "[rpc-guard] node is starting (code -28). retry $$n"; sleep 2; continue;
+          CHAIN=$$(echo "$$OUT" | jq -r '.result.chain // empty');
+
+          # If we got *any* JSON back, the node is reachable.
+          if [ "$$MODE" = "lenient" ]; then
+            if [ "$$ERR_CODE" = "-28" ] || [ -n "$$CHAIN" ]; then
+              echo "[rpc-guard] OK (lenient): reachable; ERR_CODE=$$ERR_CODE, CHAIN=$$CHAIN, IBD=$$IBD";
+              : > /tmp/healthy; break;
+            fi
+          else
+            # ready-mode requires not in IBD and no -28 error
+            if [ -n "$$CHAIN" ] && [ "$$IBD" = "false" ] && [ -z "$$ERR_CODE" ]; then
+              echo "[rpc-guard] OK (ready): node synced (CHAIN=$$CHAIN)";
+              : > /tmp/healthy; break;
+            fi
           fi
-          if [ "$$IBD" = "true" ]; then
-            echo "[rpc-guard] node in initial block download. retry $$n"; sleep 3; continue;
-          fi
-          if [ -n "$$OUT" ] && [ "$$IBD" = "false" ]; then
-            echo "[rpc-guard] OK: node ready"; : > /tmp/healthy; break;
-          fi
-          echo "[rpc-guard] not ready (retry $$n)"; sleep 2;
+
+          echo "[rpc-guard] not ready yet (mode=$$MODE, err=$$ERR_CODE, ibd=$$IBD) retry $$n"; sleep 3;
         done;
         exec tail -f /dev/null
     healthcheck:
@@ -176,12 +187,11 @@ services:
       options: { max-size: "2m", max-file: "3" }
 
   bot:
-    build: .'
+    build: .
     container_name: tipbot-bot
     restart: unless-stopped
     env_file: .env
     environment:
-      # Force *all* code paths to the same RPC endpoint
       LKY_RPC_URL: http://rpc-proxy:9918
       NODE_RPC_URL: http://rpc-proxy:9918
       RPC_URL: http://rpc-proxy:9918
@@ -205,12 +215,11 @@ services:
       options: { max-size: "10m", max-file: "5" }
 
   worker:
-    build: .'
+    build: .
     container_name: tipbot-worker
     restart: unless-stopped
     env_file: .env
     environment:
-      # Force *all* code paths to the same RPC endpoint
       LKY_RPC_URL: http://rpc-proxy:9918
       NODE_RPC_URL: http://rpc-proxy:9918
       RPC_URL: http://rpc-proxy:9918
