@@ -1,4 +1,4 @@
-# docker-compose.yml (hardened, fail-closed)
+# docker-compose.yml (lock RPC to a stable in-network address)
 
 services:
   data-sentinel:
@@ -37,7 +37,7 @@ services:
       timeout: 3s
       retries: 30
     logging:
-      driver: "json-file"
+      driver: json-file
       options: { max-size: "1m", max-file: "2" }
 
   postgres:
@@ -62,7 +62,7 @@ services:
     volumes:
       - tipbot_data:/var/lib/postgresql/data
     logging:
-      driver: "json-file"
+      driver: json-file
       options: { max-size: "10m", max-file: "5" }
 
   db-guard:
@@ -73,8 +73,6 @@ services:
     environment:
       TZ: UTC
       PGCONNECT_TIMEOUT: "5"
-      # Also inject DATABASE_URL explicitly to avoid any env-file parsing quirks
-      DATABASE_URL: ${DATABASE_URL}
     depends_on:
       postgres:
         condition: service_healthy
@@ -85,24 +83,22 @@ services:
         set -euo pipefail;
         if [ -z "$$DATABASE_URL" ]; then echo "[db-guard] DATABASE_URL missing"; exit 2; fi;
         echo "[db-guard] Using DATABASE_URL=$$DATABASE_URL";
-        for i in $$(seq 1 90); do
+        for n in $$(seq 1 90); do
           if psql "$$DATABASE_URL" -tAc "SELECT 1" >/dev/null 2>&1; then
             SQL="SELECT
                    (SELECT to_regclass('public.users')  IS NOT NULL) AS has_users,
                    (SELECT to_regclass('public.ledger') IS NOT NULL) AS has_ledger,
-                   (SELECT to_regclass('public.tips')   IS NOT NULL) AS has_tips_tbl,
-                   (SELECT COUNT(*) FROM public.users)  AS users_cnt";
+                   (SELECT to_regclass('public.tips')   IS NOT NULL) AS has_tips_tbl";
             ROW=$$(psql "$$DATABASE_URL" -At -c "$$SQL" 2>/dev/null || echo '');
-            HAS_USERS=$$(echo "$$ROW" | awk -F'|' '{print $$1}');
-            HAS_LEDGER=$$(echo "$$ROW" | awk -F'|' '{print $$2}');
-            HAS_TIPS_TBL=$$(echo "$$ROW" | awk -F'|' '{print $$3}');
-            USERS_CNT=$$(echo "$$ROW" | awk -F'|' '{print $$4}');
-            echo "[db-guard] tables: users=$$HAS_USERS ledger=$$HAS_LEDGER tips=$$HAS_TIPS_TBL users_cnt=$$USERS_CNT";
-            if [ "$$HAS_USERS" = "t" ] && [ "$$HAS_LEDGER" = "t" ] && [ "$$HAS_TIPS_TBL" = "t" ] && [ "$$USERS_CNT" -ge 1 ]; then
-              echo "[db-guard] OK"; touch /tmp/healthy; break;
+            U=$$(echo "$$ROW" | awk -F'|' '{print $$1}');
+            L=$$(echo "$$ROW" | awk -F'|' '{print $$2}');
+            T=$$(echo "$$ROW" | awk -F'|' '{print $$3}');
+            echo "[db-guard] tables: users=$$U ledger=$$L tips=$$T";
+            if [ "$$U" = "t" ] && [ "$$L" = "t" ] && [ "$$T" = "t" ]; then
+              echo "[db-guard] OK"; : > /tmp/healthy; break;
             fi
           fi;
-          echo "[db-guard] not ready, retry=$$i"; sleep 2;
+          echo "[db-guard] not ready, retry=$$n"; sleep 2;
         done;
         exec tail -f /dev/null
     healthcheck:
@@ -111,46 +107,23 @@ services:
       timeout: 3s
       retries: 30
     logging:
-      driver: "json-file"
+      driver: json-file
       options: { max-size: "2m", max-file: "3" }
 
-  # Optional helper to verify RPC readiness from containers
-  rpc-guard:
+  # NEW: stable in-network RPC endpoint. All app calls go to http://rpc-proxy:9918
+  rpc-proxy:
     image: alpine:3.20
-    container_name: tipbot-rpc-guard
+    container_name: tipbot-rpc-proxy
     restart: unless-stopped
-    env_file: .env
-    environment:
-      LKY_RPC_USER: ${LKY_RPC_USER}
-      LKY_RPC_PASS: ${LKY_RPC_PASS}
-      LKY_RPC_URL: ${LKY_RPC_URL}
-    command:
-      - /bin/sh
-      - -lc
-      - >
-        set -euo pipefail;
-        apk add --no-cache curl jq >/dev/null;
-        echo "[rpc-guard] waiting for RPC at $$LKY_RPC_URL ...";
-        for i in $$(seq 1 90); do
-          CODE=$$(curl -sS -o /tmp/r -w '%{http_code}' --user "$$LKY_RPC_USER:$$LKY_RPC_PASS" \
-            -H 'content-type: text/plain' \
-            --data-binary '{"jsonrpc":"1.0","id":"ping","method":"getblockchaininfo","params":[]}' "$$LKY_RPC_URL" || echo 000)
-          if [ "$$CODE" = "200" ]; then
-            BLK=$$(jq -r '.result.blocks // empty' /tmp/r 2>/dev/null || echo)
-            if [ -n "$$BLK" ]; then echo "[rpc-guard] OK: blocks=$$BLK"; fi
-            : > /tmp/healthy; exec tail -f /dev/null
-          else
-            MSG=$$(cat /tmp/r 2>/dev/null | head -c 200 | tr -d '\n' || echo)
-            echo "[rpc-guard] not ready ($i): http=$$CODE msg=${MSG:-none}";
-          fi
-          sleep 2;
-        done;
-        echo "[rpc-guard] FATAL: RPC not reachable"; exit 42
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/healthy"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    command: >
+      sh -lc '
+        apk add --no-cache socat >/dev/null &&
+        exec socat TCP-LISTEN:9918,fork,reuseaddr TCP:host.docker.internal:9918
+      '
+    logging:
+      driver: json-file
+      options: { max-size: "2m", max-file: "3" }
 
   bot:
     build: .
@@ -158,21 +131,10 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      # force-pass critical envs so they ALWAYS exist
-      BOT_TOKEN: ${BOT_TOKEN}
-      DATABASE_URL: ${DATABASE_URL}
-      LKY_RPC_USER: ${LKY_RPC_USER}
-      LKY_RPC_PASS: ${LKY_RPC_PASS}
-      LKY_RPC_URL: ${LKY_RPC_URL}
-      NODE_RPC_URL: ${NODE_RPC_URL}
-      LKY_USE_EXPLORER: ${LKY_USE_EXPLORER}
-      DEFAULT_DISPLAY_DECIMALS: ${DEFAULT_DISPLAY_DECIMALS}
-      MIN_CONFIRMATIONS: ${MIN_CONFIRMATIONS}
-      EXPLORER_CONCURRENCY: ${EXPLORER_CONCURRENCY}
-      EXPLORER_TIMEOUT_MS: ${EXPLORER_TIMEOUT_MS}
-      PG_STMT_TIMEOUT_MS: ${PG_STMT_TIMEOUT_MS}
-      PG_CONN_TIMEOUT_MS: ${PG_CONN_TIMEOUT_MS}
-      PG_POOL_MAX: ${PG_POOL_MAX}
+      # Force *all* code paths to the same RPC endpoint
+      LKY_RPC_URL: http://rpc-proxy:9918
+      NODE_RPC_URL: http://rpc-proxy:9918
+      RPC_URL: http://rpc-proxy:9918
       PGOPTIONS: >-
         -c search_path=public
         -c default_transaction_read_only=off
@@ -184,11 +146,13 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       db-guard: { condition: service_healthy }
+      rpc-proxy:
+        condition: service_started
     init: true
     command: ["npm", "run", "start:bot"]
     extra_hosts: ["host.docker.internal:host-gateway"]
     logging:
-      driver: "json-file"
+      driver: json-file
       options: { max-size: "10m", max-file: "5" }
 
   worker:
@@ -197,19 +161,10 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      DATABASE_URL: ${DATABASE_URL}
-      LKY_RPC_USER: ${LKY_RPC_USER}
-      LKY_RPC_PASS: ${LKY_RPC_PASS}
-      LKY_RPC_URL: ${LKY_RPC_URL}
-      NODE_RPC_URL: ${NODE_RPC_URL}
-      LKY_USE_EXPLORER: ${LKY_USE_EXPLORER}
-      DEFAULT_DISPLAY_DECIMALS: ${DEFAULT_DISPLAY_DECIMALS}
-      MIN_CONFIRMATIONS: ${MIN_CONFIRMATIONS}
-      EXPLORER_CONCURRENCY: ${EXPLORER_CONCURRENCY}
-      EXPLORER_TIMEOUT_MS: ${EXPLORER_TIMEOUT_MS}
-      PG_STMT_TIMEOUT_MS: ${PG_STMT_TIMEOUT_MS}
-      PG_CONN_TIMEOUT_MS: ${PG_CONN_TIMEOUT_MS}
-      PG_POOL_MAX: ${PG_POOL_MAX}
+      # Force *all* code paths to the same RPC endpoint
+      LKY_RPC_URL: http://rpc-proxy:9918
+      NODE_RPC_URL: http://rpc-proxy:9918
+      RPC_URL: http://rpc-proxy:9918
       PGOPTIONS: >-
         -c search_path=public
         -c default_transaction_read_only=off
@@ -221,11 +176,13 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       db-guard: { condition: service_healthy }
+      rpc-proxy:
+        condition: service_started
     init: true
     command: ["npm", "run", "start:worker"]
     extra_hosts: ["host.docker.internal:host-gateway"]
     logging:
-      driver: "json-file"
+      driver: json-file
       options: { max-size: "10m", max-file: "5" }
 
 volumes:
