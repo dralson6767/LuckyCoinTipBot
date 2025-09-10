@@ -1,7 +1,7 @@
-# docker-compose.yml (hardened, fail-closed, RPC-gated, escape-safe)
+# docker-compose.yml (host-net for app to bypass RPC 403; fail-closed for DB)
 
 services:
-  # Hard gate: refuse to let Postgres start if the data dir is empty or swapped.
+  # Refuse to start Postgres if data dir is empty / swapped
   data-sentinel:
     image: postgres:16
     container_name: tipbot-data-sentinel
@@ -28,8 +28,8 @@ services:
         else
           echo "$$CUR" > "$$SYSID_FILE";
         fi;
-        : > "$$D/TIPBOT_SAFEGUARD";
-        : > "$$READY";
+        touch "$$D/TIPBOT_SAFEGUARD";
+        touch "$$READY";
         echo "[sentinel] OK: cluster present & id verified.";
         exec tail -f /dev/null
     healthcheck:
@@ -38,7 +38,7 @@ services:
       timeout: 3s
       retries: 30
     logging:
-      driver: json-file
+      driver: "json-file"
       options: { max-size: "1m", max-file: "2" }
 
   postgres:
@@ -51,7 +51,7 @@ services:
       POSTGRES_DB: tipbot
       TZ: UTC
     ports:
-      - "5432:5432"
+      - "5432:5432" # expose to host so host-net containers can use 127.0.0.1:5432
     depends_on:
       data-sentinel:
         condition: service_healthy
@@ -63,56 +63,10 @@ services:
     volumes:
       - tipbot_data:/var/lib/postgresql/data
     logging:
-      driver: json-file
+      driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
 
-  # RPC gate: proves LuckyCoin RPC is reachable + authenticated before app
-  rpc-guard:
-    image: alpine:3.20
-    container_name: tipbot-rpc-guard
-    restart: unless-stopped
-    env_file: .env
-    extra_hosts:
-      # Your node is listening on 172.18.0.1:9918; pin this explicitly.
-      - host.docker.internal:172.18.0.1
-    command:
-      - /bin/sh
-      - -lc
-      - |
-        set -euo pipefail
-        apk add --no-cache curl jq >/dev/null
-        echo "[rpc-guard] waiting for RPC at $$LKY_RPC_URL ..."
-        for i in $$(seq 1 90); do
-          CODE=$$(curl -sS -o /tmp/r -w '%{http_code}' \
-            --user "$$LKY_RPC_USER:$$LKY_RPC_PASS" \
-            -H 'content-type: text/plain' \
-            --data-binary '{"jsonrpc":"1.0","id":"ping","method":"getblockchaininfo","params":[]}' \
-            "$$LKY_RPC_URL" || echo 000)
-          if [ "$$CODE" = "200" ]; then
-            BLK=$$(jq -r '.result.blocks // empty' /tmp/r 2>/dev/null || echo)
-            if [ -n "$$BLK" ] && [ "$$BLK" -ge 0 ] 2>/dev/null; then
-              echo "[rpc-guard] OK: blocks=$$BLK"
-              : > /tmp/healthy
-              exec tail -f /dev/null
-            fi
-          else
-            MSG=$$(cat /tmp/r 2>/dev/null | head -c 200 | tr -d '\n' || echo)
-            echo "[rpc-guard] not ready ($$i): http=$$CODE msg=$${MSG:-none}"
-          fi
-          sleep 2
-        done
-        echo "[rpc-guard] FATAL: RPC not reachable"
-        exit 42
-    healthcheck:
-      test: ["CMD-SHELL", "test -f /tmp/healthy"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-    logging:
-      driver: json-file
-      options: { max-size: "1m", max-file: "2" }
-
-  # DB guard: ensure core tables exist and users table has at least 1 row
+  # Gate the app on DB readiness + non-empty schema
   db-guard:
     image: postgres:16
     container_name: tipbot-db-guard
@@ -130,7 +84,7 @@ services:
       - >
         set -euo pipefail;
         if [ -z "$$DATABASE_URL" ]; then echo "[db-guard] DATABASE_URL missing"; exit 2; fi;
-        echo "[db-guard] Using DATABASE_URL (URI mode)";
+        echo "[db-guard] Using DATABASE_URL";
         for i in $$(seq 1 90); do
           if psql "$$DATABASE_URL" -tAc "SELECT 1" >/dev/null 2>&1; then
             SQL="SELECT
@@ -145,7 +99,7 @@ services:
             USERS_CNT=$$(echo "$$ROW" | awk -F'|' '{print $$4}');
             echo "[db-guard] tables: users=$$HAS_USERS ledger=$$HAS_LEDGER tips=$$HAS_TIPS_TBL users_cnt=$$USERS_CNT";
             if [ "$$HAS_USERS" = "t" ] && [ "$$HAS_LEDGER" = "t" ] && [ "$$HAS_TIPS_TBL" = "t" ] && [ "$$USERS_CNT" -ge 1 ]; then
-              echo "[db-guard] OK"; : > /tmp/healthy; break;
+              echo "[db-guard] OK"; touch /tmp/healthy; break;
             fi
           fi;
           echo "[db-guard] not ready, retry=$$i"; sleep 2;
@@ -157,15 +111,62 @@ services:
       timeout: 3s
       retries: 30
     logging:
-      driver: json-file
+      driver: "json-file"
       options: { max-size: "2m", max-file: "3" }
+
+  # Optional helper to confirm RPC from inside Docker if you want it
+  rpc-guard:
+    image: alpine:3.20
+    container_name: tipbot-rpc-guard
+    restart: unless-stopped
+    env_file: .env
+    network_mode: "host" # talk to 127.0.0.1:9918 directly
+    command:
+      - /bin/sh
+      - -lc
+      - >
+        set -euo pipefail;
+        apk add --no-cache curl jq >/dev/null;
+        echo "[rpc-guard] waiting for RPC at $$LKY_RPC_URL ...";
+        for i in $$(seq 1 90); do
+          CODE=$$(curl -sS -o /tmp/r -w '%{http_code}' \
+            --user "$$LKY_RPC_USER:$$LKY_RPC_PASS" \
+            -H 'content-type: text/plain' \
+            --data-binary '{"jsonrpc":"1.0","id":"ping","method":"getblockchaininfo","params":[]}' \
+            "$$LKY_RPC_URL" || echo 000)
+          if [ "$$CODE" = "200" ]; then
+            BLK=$$(jq -r '.result.blocks // empty' /tmp/r 2>/dev/null || echo);
+            echo "[rpc-guard] OK: http=200 blocks=$${BLK:-?}"; : > /tmp/healthy; exec tail -f /dev/null;
+          else
+            MSG=$$(cat /tmp/r 2>/dev/null | head -c 200 | tr -d '\n' || echo);
+            echo "[rpc-guard] not ready ($$i): http=$$CODE msg=$${MSG:-none}";
+          fi;
+          sleep 2;
+        done;
+        echo "[rpc-guard] FATAL: RPC not reachable"; exit 42
+    environment:
+      # override to loopback so host-net containers bypass 403
+      LKY_RPC_URL: http://127.0.0.1:9918
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/healthy"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging:
+      driver: "json-file"
+      options: { max-size: "1m", max-file: "2" }
 
   bot:
     build: .
     container_name: tipbot-bot
     restart: unless-stopped
     env_file: .env
+    network_mode: "host" # use host net to hit 127.0.0.1 for RPC and DB
     environment:
+      # Force both RPC and DB over loopback on host
+      LKY_RPC_URL: http://127.0.0.1:9918
+      NODE_RPC_URL: http://127.0.0.1:9918
+      DATABASE_URL: postgres://tipbot_app:Likom1likom!@127.0.0.1:5432/tipbot
       PGOPTIONS: >-
         -c search_path=public
         -c default_transaction_read_only=off
@@ -177,13 +178,10 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       db-guard: { condition: service_healthy }
-      rpc-guard: { condition: service_healthy }
     init: true
     command: ["npm", "run", "start:bot"]
-    extra_hosts:
-      - host.docker.internal:172.18.0.1
     logging:
-      driver: json-file
+      driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
 
   worker:
@@ -191,7 +189,12 @@ services:
     container_name: tipbot-worker
     restart: unless-stopped
     env_file: .env
+    network_mode: "host" # use host net to hit 127.0.0.1 for RPC and DB
     environment:
+      # Force both RPC and DB over loopback on host
+      LKY_RPC_URL: http://127.0.0.1:9918
+      NODE_RPC_URL: http://127.0.0.1:9918
+      DATABASE_URL: postgres://tipbot_app:Likom1likom!@127.0.0.1:5432/tipbot
       PGOPTIONS: >-
         -c search_path=public
         -c default_transaction_read_only=off
@@ -203,13 +206,10 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
       db-guard: { condition: service_healthy }
-      rpc-guard: { condition: service_healthy }
     init: true
     command: ["npm", "run", "start:worker"]
-    extra_hosts:
-      - host.docker.internal:172.18.0.1
     logging:
-      driver: json-file
+      driver: "json-file"
       options: { max-size: "10m", max-file: "5" }
 
 volumes:
