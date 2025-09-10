@@ -1,4 +1,5 @@
-version: "3"
+# Compose file for LuckyCoin TipBot with robust RPC proxying and gating.
+# Note: no `version:` key (Docker warns it's obsolete).
 
 services:
   data-sentinel:
@@ -28,7 +29,7 @@ services:
           echo "$$CUR" > "$$SYSID_FILE";
         fi;
         touch "$$D/TIPBOT_SAFEGUARD";
-        touch "$$READY";
+        : > "$$READY";
         echo "[sentinel] OK: cluster present & id verified.";
         exec tail -f /dev/null
     healthcheck:
@@ -49,11 +50,9 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: tipbot
       TZ: UTC
-    ports:
-      - "5432:5432"
+    ports: ["5432:5432"]
     depends_on:
-      data-sentinel:
-        condition: service_healthy
+      data-sentinel: { condition: service_healthy }
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d tipbot"]
       interval: 5s
@@ -74,8 +73,7 @@ services:
       TZ: UTC
       PGCONNECT_TIMEOUT: "5"
     depends_on:
-      postgres:
-        condition: service_healthy
+      postgres: { condition: service_healthy }
     command:
       - /bin/sh
       - -lc
@@ -110,24 +108,47 @@ services:
       driver: json-file
       options: { max-size: "2m", max-file: "3" }
 
-  # Stable in-network RPC endpoint. All app calls go to http://rpc-proxy:9918
+  # In-network RPC endpoint the app will use: http://rpc-proxy:9918
+  # Forwards to host's luckycoind RPC port via LKY_BACKEND_PORT from .env
   rpc-proxy:
     image: alpine:3.20
     container_name: tipbot-rpc-proxy
     restart: unless-stopped
+    env_file: .env
     extra_hosts: ["host.docker.internal:host-gateway"]
-    command: >
-      sh -lc '
-        apk add --no-cache socat >/dev/null &&
-        exec socat TCP-LISTEN:9918,fork,reuseaddr TCP:host.docker.internal:9918
-      '
+    command:
+      - /bin/sh
+      - -lc
+      - >
+        set -e;
+        apk add --no-cache socat curl jq >/dev/null;
+        echo "[rpc-proxy] forwarding :9918 -> host.docker.internal:${LKY_BACKEND_PORT:-9918}";
+        exec socat -d -d -v \
+          TCP-LISTEN:9918,fork,reuseaddr,keepalive \
+          TCP:host.docker.internal:${LKY_BACKEND_PORT:-9918},keepalive
+    healthcheck:
+      # Healthy if the *full path* returns JSON (either result or error -28 while loading)
+      test: >
+        sh -lc '
+          OUT=$$(curl -sS --max-time 3 --user "$$LKY_RPC_USER:$$LKY_RPC_PASS" -H content-type:application/json
+                 --data "{\"jsonrpc\":\"1.0\",\"id\":\"hc\",\"method\":\"getblockchaininfo\",\"params\":[]}"
+                 http://localhost:9918 || true);
+          CODE=$$(echo "$$OUT" | jq -r ".error.code // empty");
+          CHAIN=$$(echo "$$OUT" | jq -r ".result.chain // empty");
+          [ "$$CODE" = "-28" ] || [ -n "$$CHAIN" ]
+        '
+      interval: 5s
+      timeout: 4s
+      retries: 30
+      start_period: 10s
     logging:
       driver: json-file
       options: { max-size: "2m", max-file: "3" }
 
-  # Guard that waits for the node. MODE:
-  #   lenient (default): healthy on any JSON reply (OK or -28 Loading block index)
-  #   ready: healthy only when IBD=false (fully synced)
+  # Guard that gates the app on RPC reachability.
+  # Modes:
+  #   lenient (default): healthy on any JSON reply (OK or -28 "Loading block index")
+  #   ready:   healthy only when initialblockdownload=false (fully synced)
   rpc-guard:
     image: alpine:3.20
     container_name: tipbot-rpc-guard
@@ -140,8 +161,7 @@ services:
       RPC_GUARD_MODE: ${RPC_GUARD_MODE:-lenient}
       TZ: UTC
     depends_on:
-      rpc-proxy:
-        condition: service_started
+      rpc-proxy: { condition: service_healthy }
     extra_hosts: ["host.docker.internal:host-gateway"]
     command:
       - /bin/sh
@@ -154,27 +174,17 @@ services:
         MODE="$${RPC_GUARD_MODE:-lenient}";
         echo "[rpc-guard] waiting for node at $$URL (mode=$$MODE)";
         for n in $$(seq 1 1800); do
-          OUT=$$(curl -sS --user "$$USERPASS" -H "content-type: application/json" \
+          OUT=$$(curl -sS --user "$$USERPASS" -H content-type:application/json \
                  --data '{"jsonrpc":"1.0","id":"ping","method":"getblockchaininfo","params":[]}' "$$URL" || true);
-          ERR_CODE=$$(echo "$$OUT" | jq -r '.error.code // empty');
+          ERR=$$(echo "$$OUT" | jq -r '.error.code // empty');
           IBD=$$(echo "$$OUT" | jq -r '.result.initialblockdownload // empty');
           CHAIN=$$(echo "$$OUT" | jq -r '.result.chain // empty');
-
-          # If we got *any* JSON back, the node is reachable.
           if [ "$$MODE" = "lenient" ]; then
-            if [ "$$ERR_CODE" = "-28" ] || [ -n "$$CHAIN" ]; then
-              echo "[rpc-guard] OK (lenient): reachable; ERR_CODE=$$ERR_CODE, CHAIN=$$CHAIN, IBD=$$IBD";
-              : > /tmp/healthy; break;
-            fi
+            if [ "$$ERR" = "-28" ] || [ -n "$$CHAIN" ]; then echo "[rpc-guard] OK lenient (err=$$ERR, chain=$$CHAIN, ibd=$$IBD)"; :>/tmp/healthy; break; fi
           else
-            # ready-mode requires not in IBD and no -28 error
-            if [ -n "$$CHAIN" ] && [ "$$IBD" = "false" ] && [ -z "$$ERR_CODE" ]; then
-              echo "[rpc-guard] OK (ready): node synced (CHAIN=$$CHAIN)";
-              : > /tmp/healthy; break;
-            fi
+            if [ -n "$$CHAIN" ] && [ "$$IBD" = "false" ] && [ -z "$$ERR" ]; then echo "[rpc-guard] OK ready (chain=$$CHAIN)"; :>/tmp/healthy; break; fi
           fi
-
-          echo "[rpc-guard] not ready yet (mode=$$MODE, err=$$ERR_CODE, ibd=$$IBD) retry $$n"; sleep 3;
+          echo "[rpc-guard] not ready (mode=$$MODE, err=$$ERR, ibd=$$IBD) retry $$n"; sleep 3;
         done;
         exec tail -f /dev/null
     healthcheck:
