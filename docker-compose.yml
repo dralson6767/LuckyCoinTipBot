@@ -16,34 +16,17 @@ services:
       driver: json-file
       options: { max-size: "10m", max-file: "5" }
 
-  rpc-proxy:
-    image: alpine:3.20
-    container_name: tipbot-rpc-proxy
-    restart: unless-stopped
-    env_file: .env
-    extra_hosts: ["host.docker.internal:host-gateway"]
-    command:
-      - /bin/sh
-      - -lc
-      - >
-        apk add --no-cache socat >/dev/null;
-        exec socat TCP-LISTEN:9918,fork,reuseaddr,keepalive
-             TCP:host.docker.internal:${LKY_BACKEND_PORT:-9918},keepalive
-    logging:
-      driver: json-file
-      options: { max-size: "2m", max-file: "3" }
-
   bot:
     build: .
     container_name: tipbot-bot
     restart: unless-stopped
     env_file: .env
     environment:
-      LKY_RPC_URL: http://rpc-proxy:9918
-      NODE_RPC_URL: http://rpc-proxy:9918
-      RPC_URL: http://rpc-proxy:9918
+      LKY_RPC_URL: http://host.docker.internal:9918
+      NODE_RPC_URL: http://host.docker.internal:9918
+      RPC_URL: http://host.docker.internal:9918
       TZ: UTC
-    depends_on: [postgres, rpc-proxy]
+    depends_on: [postgres]
     init: true
     command: ["npm", "run", "start:bot"]
     extra_hosts: ["host.docker.internal:host-gateway"]
@@ -57,11 +40,11 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      LKY_RPC_URL: http://rpc-proxy:9918
-      NODE_RPC_URL: http://rpc-proxy:9918
-      RPC_URL: http://rpc-proxy:9918
+      LKY_RPC_URL: http://host.docker.internal:9918
+      NODE_RPC_URL: http://host.docker.internal:9918
+      RPC_URL: http://host.docker.internal:9918
       TZ: UTC
-    depends_on: [postgres, rpc-proxy]
+    depends_on: [postgres]
     init: true
     command: ["npm", "run", "start:worker"]
     extra_hosts: ["host.docker.internal:host-gateway"]
