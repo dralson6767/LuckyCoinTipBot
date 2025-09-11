@@ -1,8 +1,6 @@
 services:
   postgres:
     image: postgres:16
-    container_name: tipbot-postgres
-    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -12,14 +10,9 @@ services:
       - "5432:5432"
     volumes:
       - tipbot_data:/var/lib/postgresql/data
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "5" }
 
   bot:
     build: .
-    container_name: tipbot-bot
-    restart: unless-stopped
     env_file: .env
     environment:
       LKY_RPC_URL: http://host.docker.internal:9918
@@ -30,14 +23,9 @@ services:
     init: true
     command: ["npm", "run", "start:bot"]
     extra_hosts: ["host.docker.internal:host-gateway"]
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "5" }
 
   worker:
     build: .
-    container_name: tipbot-worker
-    restart: unless-stopped
     env_file: .env
     environment:
       LKY_RPC_URL: http://host.docker.internal:9918
@@ -48,9 +36,6 @@ services:
     init: true
     command: ["npm", "run", "start:worker"]
     extra_hosts: ["host.docker.internal:host-gateway"]
-    logging:
-      driver: json-file
-      options: { max-size: "10m", max-file: "5" }
 
 volumes:
   tipbot_data:
