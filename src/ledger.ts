@@ -1,5 +1,20 @@
-// src/ledger.ts
 import { query } from "./db.js";
+
+/**
+ * Ledger + Users helpers with compacted tip logic.
+ *
+ * Balances are now computed as:
+ *   balance_lites = users.transferred_tip_lites
+ *                 + SUM(ledger.delta_lites WHERE reason IN ('deposit','withdrawal'))
+ *
+ * Tip operations (transfer) update `users.transferred_tip_lites` directly,
+ * and may still write paired tip rows to `ledger` (for audit/pairing),
+ * but those rows are no longer used in balance calculations.
+ */
+
+// -----------------------------------------------------------------------------
+// Types
+// -----------------------------------------------------------------------------
 
 type TgLike = {
   id: number;
@@ -14,7 +29,7 @@ export type DbUser = {
   username: string | null;
 };
 
-type LedgerReason =
+export type LedgerReason =
   | "deposit"
   | "withdrawal"
   | "tip_out"
@@ -24,6 +39,19 @@ type LedgerReason =
   | "airdrop_out"
   | "airdrop_in";
 
+const TIP_REASONS: LedgerReason[] = [
+  "tip_out",
+  "tip_in",
+  "rain_out",
+  "rain_in",
+  "airdrop_out",
+  "airdrop_in",
+];
+
+// -----------------------------------------------------------------------------
+// Utilities
+// -----------------------------------------------------------------------------
+
 /** normalize @username → lowercase, no leading '@' */
 function normUsername(u?: string | null): string | null {
   if (!u) return null;
@@ -32,26 +60,43 @@ function normUsername(u?: string | null): string | null {
   return (s.startsWith("@") ? s.slice(1) : s).toLowerCase();
 }
 
+// -----------------------------------------------------------------------------
+// Users
+// -----------------------------------------------------------------------------
+
 /** Ensure a users row exists; update username if provided. */
 export async function ensureUser(tg: TgLike): Promise<DbUser> {
   const tgId = Number(tg.id);
   const uname = normUsername(tg.username);
   const res = await query<DbUser>(
     `INSERT INTO public.users (tg_user_id, username)
-     VALUES ($1,$2)
+       VALUES ($1,$2)
      ON CONFLICT (tg_user_id)
-     DO UPDATE SET username = COALESCE(EXCLUDED.username, public.users.username)
+       DO UPDATE SET username = COALESCE(EXCLUDED.username, public.users.username)
      RETURNING id, tg_user_id, username`,
     [tgId, uname]
   );
   return res.rows[0];
 }
 
-/** Sum of all ledger deltas (in lites) for a user. */
+// -----------------------------------------------------------------------------
+// Balance (compacted)
+// -----------------------------------------------------------------------------
+
+/**
+ * Return the user's balance in lites as BigInt using compacted logic:
+ *   users.transferred_tip_lites + SUM(ledger for deposit/withdrawal)
+ */
 export async function balanceLites(userId: number): Promise<bigint> {
   const r = await query<{ s: string }>(
-    `SELECT COALESCE(SUM(delta_lites),0)::text AS s
-     FROM public.ledger WHERE user_id=$1`,
+    `SELECT (
+        u.transferred_tip_lites
+        + COALESCE(SUM(CASE WHEN l.reason IN ('deposit','withdrawal') THEN l.delta_lites ELSE 0 END), 0)
+      )::text AS s
+       FROM public.users u
+       LEFT JOIN public.ledger l ON l.user_id = u.id
+      WHERE u.id = $1
+      GROUP BY u.id, u.transferred_tip_lites`,
     [userId]
   );
   return BigInt(r.rows[0]?.s ?? "0");
@@ -74,6 +119,10 @@ export async function findUserByUsername(
   return r.rows[0] ?? null;
 }
 
+// -----------------------------------------------------------------------------
+// Ledger insert helpers
+// -----------------------------------------------------------------------------
+
 /** Internal: insert a ledger row idempotently using the UNIQUE constraint. */
 async function insertLedger(
   userId: number,
@@ -85,27 +134,19 @@ async function insertLedger(
   const ts = (at ?? new Date()).toISOString();
   const res = await query<{ id: number }>(
     `INSERT INTO public.ledger(user_id, delta_lites, reason, ref, created_at)
-     VALUES ($1, $2::bigint, $3, $4, $5)
+       VALUES ($1, $2::bigint, $3, $4, $5)
      ON CONFLICT ON CONSTRAINT ledger_reason_ref_unique DO NOTHING
      RETURNING id`,
     [userId, delta.toString(), reason, ref, ts]
   );
   const id = res.rows[0]?.id ?? null;
 
-  // Pair tips immediately when applicable (safe no-op if function missing)
-  if (
-    id !== null &&
-    (reason === "tip_out" ||
-      reason === "tip_in" ||
-      reason === "rain_out" ||
-      reason === "rain_in" ||
-      reason === "airdrop_out" ||
-      reason === "airdrop_in")
-  ) {
+  // Still attempt to pair tips for audit/history; no effect on balances.
+  if (id !== null && TIP_REASONS.includes(reason)) {
     try {
       await query(`SELECT public.tips_try_pair($1::BIGINT)`, [id]);
     } catch {
-      /* ignore */
+      /* ignore pairing errors */
     }
   }
   return id;
@@ -139,7 +180,17 @@ export async function debit(
   return insertLedger(userId, -amt, reason, ref, at);
 }
 
-/** High-level tip transfer: writes tip_out and tip_in with the SAME ref. */
+// -----------------------------------------------------------------------------
+// Transfers (tips)
+// -----------------------------------------------------------------------------
+
+/**
+ * High-level tip transfer between users.
+ * - Ensures sufficient balance using compacted logic.
+ * - Writes paired tip rows to ledger (optional audit),
+ * - Updates users.transferred_tip_lites for both users so balances remain correct
+ *   even if tip rows are later pruned.
+ */
 export async function transfer(
   fromUserId: number,
   toUserId: number,
@@ -151,28 +202,29 @@ export async function transfer(
   const bal = await balanceLites(fromUserId);
   if (bal < amountLites) throw new Error("Insufficient balance");
 
-  const ref = `tip:${Date.now()}:${fromUserId}->${toUserId}:${amountLites.toString()}`;
-  const outId = await insertLedger(
-    fromUserId,
-    -amountLites,
-    "tip_out",
-    ref,
-    new Date()
-  );
-  const inId = await insertLedger(
-    toUserId,
-    amountLites,
-    "tip_in",
-    ref,
-    new Date()
-  );
+  const now = new Date();
+  const ref = `tip:${now.getTime()}:${fromUserId}->${toUserId}:${amountLites.toString()}`;
 
+  // Small transaction to keep things consistent.
+  await query("BEGIN");
   try {
-    if (outId != null)
-      await query(`SELECT public.tips_try_pair($1::BIGINT)`, [outId]);
-    if (inId != null)
-      await query(`SELECT public.tips_try_pair($1::BIGINT)`, [inId]);
-  } catch {
-    /* ignore */
+    // (1) Optional audit rows (kept for history/pairing; not used in balance)
+    await insertLedger(fromUserId, -amountLites, "tip_out", ref, now);
+    await insertLedger(toUserId, amountLites, "tip_in", ref, now);
+
+    // (2) Update compacted totals on users (authoritative for balances)
+    await query(
+      `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites - $1 WHERE id = $2`,
+      [amountLites.toString(), fromUserId]
+    );
+    await query(
+      `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites + $1 WHERE id = $2`,
+      [amountLites.toString(), toUserId]
+    );
+
+    await query("COMMIT");
+  } catch (e) {
+    await query("ROLLBACK");
+    throw e;
   }
 }
