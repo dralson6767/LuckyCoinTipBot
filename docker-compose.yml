@@ -12,9 +12,16 @@ services:
       - "5432:5432"
     volumes:
       - tipbot_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
     logging:
       driver: json-file
-      options: { max-size: "10m", max-file: "5" }
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   bot:
     build: .
@@ -22,17 +29,21 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      LKY_RPC_URL: http://host.docker.internal:9918
-      NODE_RPC_URL: http://host.docker.internal:9918
-      RPC_URL: http://host.docker.internal:9918
+      # Use docker bridge IP for fast, predictable RPC on Linux
+      LKY_RPC_URL: http://172.18.0.1:9918
+      NODE_RPC_URL: http://172.18.0.1:9918
+      RPC_URL: http://172.18.0.1:9918
       TZ: UTC
-    depends_on: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
     init: true
     command: ["npm", "run", "start:bot"]
-    extra_hosts: ["host.docker.internal:host-gateway"]
     logging:
       driver: json-file
-      options: { max-size: "10m", max-file: "5" }
+      options:
+        max-size: "10m"
+        max-file: "5"
 
   worker:
     build: .
@@ -40,19 +51,24 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      LKY_RPC_URL: http://host.docker.internal:9918
-      NODE_RPC_URL: http://host.docker.internal:9918
-      RPC_URL: http://host.docker.internal:9918
+      # Use docker bridge IP for fast, predictable RPC on Linux
+      LKY_RPC_URL: http://172.18.0.1:9918
+      NODE_RPC_URL: http://172.18.0.1:9918
+      RPC_URL: http://172.18.0.1:9918
       TZ: UTC
-    depends_on: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
     init: true
     command: ["npm", "run", "start:worker"]
-    extra_hosts: ["host.docker.internal:host-gateway"]
     logging:
       driver: json-file
-      options: { max-size: "10m", max-file: "5" }
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   tipbot_data:
     external: true
+    # Keep this EXACT name (confirmed on your host)
     name: tipbot_pg_sql_2025_08_31_031701
