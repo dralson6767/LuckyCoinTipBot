@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import { rpc } from "./rpc.js";
-import { pool, query, getBalanceLites } from "./db.js";
+import { query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
@@ -93,6 +93,23 @@ async function rpcTry<T>(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Hard timeout wrapper so /deposit always answers fast
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("DEPOSIT_TIMEOUT")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
+
 // ---------- /deposit address fast path ----------
 async function getFastDepositAddress(
   userId: number,
@@ -125,7 +142,7 @@ async function getFastDepositAddress(
     const r = await rpcTry<Record<string, unknown>>(
       "getaddressesbylabel",
       [label],
-      4000
+      1500
     );
     if (r.ok && r.value) {
       const existing = Object.keys(r.value || {})[0];
@@ -135,23 +152,23 @@ async function getFastDepositAddress(
 
   // 2) Legacy: list by account (if supported)
   {
-    const r = await rpcTry<string[]>("getaddressesbyaccount", [label], 4000);
+    const r = await rpcTry<string[]>("getaddressesbyaccount", [label], 1500);
     if (r.ok && Array.isArray(r.value) && r.value[0])
       return remember(r.value[0]);
   }
 
   // 3) Legacy: single current address for account (if supported)
   {
-    const r = await rpcTry<string>("getaccountaddress", [label], 6000);
+    const r = await rpcTry<string>("getaccountaddress", [label], 2000);
     if (r.ok && r.value) return remember(r.value);
   }
 
   // 4) Mint new (1-arg legacy “account” form)
   {
-    const attempt = async () => rpcTry<string>("getnewaddress", [label], 8000); // NO "legacy" second arg
+    const attempt = async () => rpcTry<string>("getnewaddress", [label], 2500); // NO "legacy" second arg
     let r = await attempt();
     if (!r.ok && isWalletBusy(r.err)) {
-      await sleep(800);
+      await sleep(600);
       r = await attempt();
     }
     if (r.ok && r.value) return remember(r.value);
@@ -159,7 +176,7 @@ async function getFastDepositAddress(
 
   // 5) Ultra-legacy: zero-arg (default account)
   {
-    const r = await rpcTry<string>("getnewaddress", [], 6000);
+    const r = await rpcTry<string>("getnewaddress", [], 1500);
     if (r.ok && r.value) return remember(r.value);
   }
 
@@ -242,7 +259,11 @@ bot.command("deposit", async (ctx) => {
   console.log("[/deposit] start", ctx.from?.id, ctx.chat?.id);
   const user = await ensureUser(ctx.from);
   try {
-    const addr = await getFastDepositAddress(user.id, ctx.from.id);
+    // hard-cap the whole sequence so the command always replies fast
+    const addr = await withTimeout(
+      getFastDepositAddress(user.id, ctx.from.id),
+      6000
+    );
     const msg = `Your LKY deposit address:\n\`${addr}\``;
     if (isGroup(ctx)) {
       await tryDelete(ctx);
@@ -276,7 +297,7 @@ bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await getBalanceLites(user.id); // <-- transferred_tip_lites + deposits - withdrawals
+    const bal = await getBalanceLites(user.id); // transferred_tip_lites + deposits - withdrawals
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       await tryDelete(ctx);
