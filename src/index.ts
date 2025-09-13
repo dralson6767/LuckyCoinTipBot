@@ -209,7 +209,7 @@ bot.help(async (ctx) => {
     "/tip — reply with `/tip 1.23` or `/tip @username 1.23`",
     "/withdraw <address> <amount> — withdraw on-chain",
     isGroup(ctx)
-      ? "\n_Use /deposit, /balance, /withdraw in DM for privacy._"
+      ? "\n*Tip:* Use /deposit, /balance, /withdraw in DM for privacy."
       : "",
   ].join("\n");
   if (isGroup(ctx)) {
@@ -271,13 +271,12 @@ bot.command("deposit", async (ctx) => {
   }
 });
 
-// ----- /balance -----
-// NEW: uses compact math -> getBalanceLites(user.id)
+// ----- /balance ----- (compact math)
 bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await getBalanceLites(user.id); // compact: transferred_tip_lites + deposits - withdrawals
+    const bal = await getBalanceLites(user.id); // <-- transferred_tip_lites + deposits - withdrawals
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       await tryDelete(ctx);
@@ -462,8 +461,7 @@ bot.command("tip", async (ctx) => {
   console.log("[/tip] ok");
 });
 
-// ----- /withdraw -----
-// NEW: uses compact math to check funds
+// ----- /withdraw ----- (compact balance check)
 bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] start");
   const sender = await ensureUser(ctx.from);
@@ -514,7 +512,7 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  const bal = await getBalanceLites(sender.id); // compact math
+  const bal = await getBalanceLites(sender.id);
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
       bal,
