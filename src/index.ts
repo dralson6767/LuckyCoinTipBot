@@ -93,7 +93,7 @@ async function rpcTry<T>(
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-// Hard timeout wrapper so /deposit always answers fast
+// Hard timeout wrapper so /deposit always answers
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("DEPOSIT_TIMEOUT")), ms);
@@ -110,21 +110,24 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// ---------- /deposit address fast path ----------
+// ---------- /deposit address fast path (simplified + logged) ----------
 async function getFastDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
+  console.log("[deposit] start", { userId, tgUserId });
+
   // 0) reuse last address from DB if any
   const prev = await query<{ address: string }>(
     "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
     [userId]
   );
-  if (prev.rows[0]?.address) return prev.rows[0].address;
+  if (prev.rows[0]?.address) {
+    console.log("[deposit] reuse db addr");
+    return prev.rows[0].address;
+  }
 
-  // label/account we try to use across RPC variants
   const label = String(tgUserId);
-
   const remember = async (addr: string) => {
     try {
       await query(
@@ -133,54 +136,40 @@ async function getFastDepositAddress(
          ON CONFLICT (address) DO NOTHING`,
         [userId, addr, label]
       );
-    } catch {}
+    } catch (e: any) {
+      console.warn("[deposit] remember insert warn:", e?.message || e);
+    }
     return addr;
   };
 
-  // 1) Modern label map (if supported)
+  // Prefer straight getnewaddress with label (fast path)
+  console.log("[deposit] try getnewaddress(label)");
   {
-    const r = await rpcTry<Record<string, unknown>>(
-      "getaddressesbylabel",
-      [label],
-      1500
-    );
+    const r = await rpcTry<string>("getnewaddress", [label], 2500);
     if (r.ok && r.value) {
-      const existing = Object.keys(r.value || {})[0];
-      if (existing) return remember(existing);
+      console.log("[deposit] got address via label");
+      return remember(r.value);
     }
+    if (!r.ok)
+      console.warn(
+        "[deposit] getnewaddress(label) ERR:",
+        r.err?.message || r.err
+      );
   }
 
-  // 2) Legacy: list by account (if supported)
+  // Fallback: getnewaddress without label (older daemons)
+  console.log("[deposit] try getnewaddress()");
   {
-    const r = await rpcTry<string[]>("getaddressesbyaccount", [label], 1500);
-    if (r.ok && Array.isArray(r.value) && r.value[0])
-      return remember(r.value[0]);
-  }
-
-  // 3) Legacy: single current address for account (if supported)
-  {
-    const r = await rpcTry<string>("getaccountaddress", [label], 2000);
-    if (r.ok && r.value) return remember(r.value);
-  }
-
-  // 4) Mint new (1-arg legacy “account” form)
-  {
-    const attempt = async () => rpcTry<string>("getnewaddress", [label], 2500); // NO "legacy" second arg
-    let r = await attempt();
-    if (!r.ok && isWalletBusy(r.err)) {
-      await sleep(600);
-      r = await attempt();
+    const r = await rpcTry<string>("getnewaddress", [], 2000);
+    if (r.ok && r.value) {
+      console.log("[deposit] got address via no-arg");
+      return remember(r.value);
     }
-    if (r.ok && r.value) return remember(r.value);
+    if (!r.ok)
+      console.warn("[deposit] getnewaddress() ERR:", r.err?.message || r.err);
   }
 
-  // 5) Ultra-legacy: zero-arg (default account)
-  {
-    const r = await rpcTry<string>("getnewaddress", [], 1500);
-    if (r.ok && r.value) return remember(r.value);
-  }
-
-  // If we got here, all variants failed on this node right now.
+  console.log("[deposit] failed all variants");
   throw new Error("DEPOSIT_ADDR_FAILED");
 }
 
@@ -276,11 +265,9 @@ bot.command("deposit", async (ctx) => {
     console.log("[/deposit] ok");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
-
     const msg = isWalletBusy(e)
       ? "Wallet is busy. Try /deposit again in a minute."
       : "Wallet temporarily unavailable. Try /deposit again shortly.";
-
     if (isGroup(ctx)) {
       await tryDelete(ctx);
       const ok = await dm(ctx, msg);
