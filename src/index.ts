@@ -2,9 +2,8 @@
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import { rpc } from "./rpc.js";
-import { query } from "./db.js";
+import { pool, query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
-import { getUserBalanceLites } from "./balance.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
 // ---------- bot init ----------
@@ -257,7 +256,6 @@ bot.command("deposit", async (ctx) => {
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
 
-    // Only call it "busy" when it actually is. Otherwise use a generic message.
     const msg = isWalletBusy(e)
       ? "Wallet is busy. Try /deposit again in a minute."
       : "Wallet temporarily unavailable. Try /deposit again shortly.";
@@ -274,11 +272,12 @@ bot.command("deposit", async (ctx) => {
 });
 
 // ----- /balance -----
+// NEW: uses compact math -> getBalanceLites(user.id)
 bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await getUserBalanceLites(user.id);
+    const bal = await getBalanceLites(user.id); // compact: transferred_tip_lites + deposits - withdrawals
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       await tryDelete(ctx);
@@ -464,6 +463,7 @@ bot.command("tip", async (ctx) => {
 });
 
 // ----- /withdraw -----
+// NEW: uses compact math to check funds
 bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] start");
   const sender = await ensureUser(ctx.from);
@@ -514,7 +514,7 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  const bal = await getUserBalanceLites(sender.id);
+  const bal = await getBalanceLites(sender.id); // compact math
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
       bal,

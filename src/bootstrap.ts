@@ -6,8 +6,7 @@
  * - Debits withdrawals to ledger
  * - Pairs tips from existing ledger rows (strict 10-min window)
  *
- * All operations are per-session. No ALTER DATABASE. No global changes.
- * If DB/session is read-only, we skip writes but DO NOT crash the process.
+ * No destructive ops. If DB/session is read-only, skip writes.
  */
 import { Client } from "pg";
 
@@ -15,23 +14,20 @@ async function main() {
   const url = process.env.DATABASE_URL;
   if (!url) {
     console.error("[bootstrap] DATABASE_URL missing");
-    process.exit(0); // don't block the rest of the app
+    process.exit(0);
   }
   const MIN_CONFS = Number(process.env.MIN_CONFIRMATIONS || 6);
 
   const c = new Client({ connectionString: url });
   await c.connect();
-
   console.log("[bootstrap] connected; enforcing search_path + constraints…");
 
-  // Per-session only; never alter DB globals.
   await c.query(`
     SET search_path TO public;
     SET default_transaction_read_only = off;
     SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;
   `);
 
-  // Coordinate multiple starters; only one does the heavy work.
   const lockRes = await c.query(
     `SELECT pg_try_advisory_lock(922337203) AS locked`
   );
@@ -43,7 +39,6 @@ async function main() {
   }
 
   try {
-    // Check if session is still read-only (e.g., true physical standby).
     const ro = await c.query(`SHOW transaction_read_only;`);
     const isRO = (ro.rows?.[0]?.transaction_read_only ?? "off") === "on";
     if (isRO) {
@@ -51,7 +46,12 @@ async function main() {
       return;
     }
 
-    // 1) Constraints we rely on (safe to rerun)
+    // Make sure legacy NULLs are zero (non-destructive; idempotent)
+    await c.query(
+      `UPDATE public.users SET transferred_tip_lites = 0 WHERE transferred_tip_lites IS NULL;`
+    );
+
+    // 1) Minimal constraints we rely on (safe to rerun)
     await c.query(`
       DO $$
       BEGIN
@@ -59,9 +59,7 @@ async function main() {
           ALTER TABLE public.ledger ADD CONSTRAINT ledger_reason_ref_unique UNIQUE (reason, ref);
         END IF;
 
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ledger_user_reason_ref_unique') THEN
-          ALTER TABLE public.ledger ADD CONSTRAINT ledger_user_reason_ref_unique UNIQUE (user_id, reason, ref);
-        END IF;
+        -- (Optional) We do NOT add ledger_user_reason_ref_unique here to avoid redundancy.
 
         IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='withdrawals_txid_unique') THEN
           ALTER TABLE public.withdrawals ADD CONSTRAINT withdrawals_txid_unique UNIQUE (txid);
@@ -69,13 +67,10 @@ async function main() {
       END $$;
     `);
 
-    console.log(
-      "[bootstrap] constraints ok; (re)installing tips functions & trigger…"
-    );
+    console.log("[bootstrap] constraints ok; (re)installing tips trigger…");
 
     // 2) (Re)install tips pairing function(s) and trigger (idempotent)
     await c.query(`
-      -- tips_try_pair: BIGINT overload (canonical)
       CREATE OR REPLACE FUNCTION public.tips_try_pair(p_ledger_id BIGINT)
       RETURNS VOID
       LANGUAGE plpgsql
@@ -96,13 +91,13 @@ async function main() {
         END IF;
 
         IF r_ledger.reason IN ('tip_out','rain_out','airdrop_out') THEN
-          SELECT l.id
-            INTO match_ledger_id
+          SELECT l.id INTO match_ledger_id
           FROM public.ledger l
           WHERE l.reason IN ('tip_in','rain_in','airdrop_in')
             AND l.user_id <> r_ledger.user_id
             AND ABS(l.delta_lites) = ABS(r_ledger.delta_lites)
-            AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes') AND (r_ledger.created_at + INTERVAL '5 minutes')
+            AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes')
+                                 AND (r_ledger.created_at + INTERVAL '5 minutes')
             AND NOT EXISTS (
               SELECT 1 FROM public.tips t
                WHERE t.ledger_out_id = r_ledger.id OR t.ledger_in_id = l.id
@@ -112,19 +107,20 @@ async function main() {
           IF match_ledger_id IS NULL THEN RETURN; END IF;
 
           INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
-          SELECT r_ledger.user_id, l.user_id, ABS(r_ledger.delta_lites), LEAST(r_ledger.created_at, l.created_at), r_ledger.id, l.id
+          SELECT r_ledger.user_id, l.user_id, ABS(r_ledger.delta_lites),
+                 LEAST(r_ledger.created_at, l.created_at), r_ledger.id, l.id
           FROM public.ledger l
           WHERE l.id = match_ledger_id
           ON CONFLICT DO NOTHING;
 
         ELSE
-          SELECT l.id
-            INTO match_ledger_id
+          SELECT l.id INTO match_ledger_id
           FROM public.ledger l
           WHERE l.reason IN ('tip_out','rain_out','airdrop_out')
             AND l.user_id <> r_ledger.user_id
             AND ABS(l.delta_lites) = ABS(r_ledger.delta_lites)
-            AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes') AND (r_ledger.created_at + INTERVAL '5 minutes')
+            AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes')
+                                 AND (r_ledger.created_at + INTERVAL '5 minutes')
             AND NOT EXISTS (
               SELECT 1 FROM public.tips t
                WHERE t.ledger_in_id = r_ledger.id OR t.ledger_out_id = l.id
@@ -134,14 +130,14 @@ async function main() {
           IF match_ledger_id IS NULL THEN RETURN; END IF;
 
           INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
-          SELECT l.user_id, r_ledger.user_id, ABS(r_ledger.delta_lites), LEAST(r_ledger.created_at, l.created_at), l.id, r_ledger.id
+          SELECT l.user_id, r_ledger.user_id, ABS(r_ledger.delta_lites),
+                 LEAST(r_ledger.created_at, l.created_at), l.id, r_ledger.id
           FROM public.ledger l
           WHERE l.id = match_ledger_id
           ON CONFLICT DO NOTHING;
         END IF;
       END $$;
 
-      -- helper overload to avoid signature errors from triggers
       CREATE OR REPLACE FUNCTION public.tips_try_pair(p_ledger_id INTEGER)
       RETURNS VOID
       LANGUAGE plpgsql
@@ -150,7 +146,6 @@ async function main() {
         PERFORM public.tips_try_pair(p_ledger_id::BIGINT);
       END $$;
 
-      -- trigger wrapper
       CREATE OR REPLACE FUNCTION public.tips_trigger_fire()
       RETURNS TRIGGER
       LANGUAGE plpgsql
@@ -160,7 +155,6 @@ async function main() {
         RETURN NEW;
       END $$;
 
-      -- trigger itself (create if missing)
       DO $$
       BEGIN
         IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'tips_after_insert') THEN
@@ -256,5 +250,5 @@ async function main() {
 
 main().catch((e) => {
   console.error("[bootstrap] non-fatal top-level:", e?.message ?? e);
-  process.exit(0); // never block the worker/index from starting
+  process.exit(0);
 });
