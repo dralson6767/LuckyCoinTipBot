@@ -8,7 +8,7 @@ import { query } from "./db.js";
  *                 + SUM(ledger.delta_lites WHERE reason IN ('deposit','withdrawal'))
  *
  * Tip operations (transfer) update `users.transferred_tip_lites` directly,
- * and may still write paired tip rows to `ledger` (for audit/pairing),
+ * and may still write paired tip rows to `ledger` (for audit),
  * but those rows are no longer used in balance calculations.
  */
 
@@ -123,7 +123,19 @@ export async function findUserByUsername(
 // Ledger insert helpers
 // -----------------------------------------------------------------------------
 
-/** Internal: insert a ledger row idempotently using the UNIQUE constraint. */
+/** Internal: find an existing ledger row id by (reason, ref). */
+async function findLedgerIdByRef(
+  reason: LedgerReason,
+  ref: string
+): Promise<number | null> {
+  const r = await query<{ id: number }>(
+    `SELECT id FROM public.ledger WHERE reason = $1 AND ref = $2 LIMIT 1`,
+    [reason, ref]
+  );
+  return r.rows[0]?.id ?? null;
+}
+
+/** Internal: insert a ledger row idempotently using the UNIQUE (reason, ref). */
 async function insertLedger(
   userId: number,
   delta: bigint,
@@ -139,17 +151,31 @@ async function insertLedger(
      RETURNING id`,
     [userId, delta.toString(), reason, ref, ts]
   );
-  const id = res.rows[0]?.id ?? null;
+  return res.rows[0]?.id ?? null;
+}
 
-  // Still attempt to pair tips for audit/history; no effect on balances.
-  if (id !== null && TIP_REASONS.includes(reason)) {
-    try {
-      await query(`SELECT public.tips_try_pair($1::BIGINT)`, [id]);
-    } catch {
-      /* ignore pairing errors */
-    }
-  }
-  return id;
+/** Internal: record a tip audit row (idempotent; relies on a UNIQUE in tips). */
+async function recordTipAudit(
+  fromUserId: number,
+  toUserId: number,
+  amountLites: bigint,
+  createdAt: Date,
+  ledgerOutId: number | null,
+  ledgerInId: number | null
+): Promise<void> {
+  await query(
+    `INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
+     VALUES ($1,$2,$3,$4,$5,$6)
+     ON CONFLICT DO NOTHING`,
+    [
+      fromUserId,
+      toUserId,
+      amountLites < 0n ? (-amountLites).toString() : amountLites.toString(),
+      createdAt.toISOString(),
+      ledgerOutId,
+      ledgerInId,
+    ]
+  );
 }
 
 /** CREDIT: positive delta (exported for scan_explorer/worker). */
@@ -187,9 +213,14 @@ export async function debit(
 /**
  * High-level tip transfer between users.
  * - Ensures sufficient balance using compacted logic.
- * - Writes paired tip rows to ledger (optional audit),
+ * - Writes paired tip rows to ledger (audit only; balances ignore them).
  * - Updates users.transferred_tip_lites for both users so balances remain correct
  *   even if tip rows are later pruned.
+ *
+ * NOTE: This uses multiple statements. If your ./db.js "query" does not keep a
+ * single connection across BEGIN/COMMIT, consider refactoring to run these
+ * inside one multi-statement call or a client/transaction helper. For now,
+ * this mirrors your existing pattern.
  */
 export async function transfer(
   fromUserId: number,
@@ -205,12 +236,21 @@ export async function transfer(
   const now = new Date();
   const ref = `tip:${now.getTime()}:${fromUserId}->${toUserId}:${amountLites.toString()}`;
 
-  // Small transaction to keep things consistent.
   await query("BEGIN");
   try {
     // (1) Optional audit rows (kept for history/pairing; not used in balance)
-    await insertLedger(fromUserId, -amountLites, "tip_out", ref, now);
-    await insertLedger(toUserId, amountLites, "tip_in", ref, now);
+    let outId = await insertLedger(
+      fromUserId,
+      -amountLites,
+      "tip_out",
+      ref,
+      now
+    );
+    let inId = await insertLedger(toUserId, amountLites, "tip_in", ref, now);
+
+    // If concurrent insert raced, fetch existing IDs by (reason, ref)
+    if (outId === null) outId = await findLedgerIdByRef("tip_out", ref);
+    if (inId === null) inId = await findLedgerIdByRef("tip_in", ref);
 
     // (2) Update compacted totals on users (authoritative for balances)
     await query(
@@ -221,6 +261,9 @@ export async function transfer(
       `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites + $1 WHERE id = $2`,
       [amountLites.toString(), toUserId]
     );
+
+    // (3) App-side tip audit (no DB trigger/function dependency)
+    await recordTipAudit(fromUserId, toUserId, amountLites, now, outId, inId);
 
     await query("COMMIT");
   } catch (e) {

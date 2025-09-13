@@ -1,12 +1,14 @@
 /**
  * Idempotent DB bootstrap that runs on every worker start.
  * - Enforces required constraints (safe to re-run)
- * - (Re)creates tips pairing function + trigger (safe to re-run)
+ * - Ensures FK integrity (adds NOT VALID FKs if missing; no heavy VALIDATE here)
  * - Credits deposits to ledger (min confirmations or credited=true)
  * - Debits withdrawals to ledger
  * - Pairs tips from existing ledger rows (strict 10-min window)
  *
- * No destructive ops. If DB/session is read-only, skip writes.
+ * IMPORTANT:
+ * - No trigger is installed (pairing is app-side).
+ * - No destructive ops.
  */
 import { Client } from "pg";
 
@@ -55,117 +57,64 @@ async function main() {
     await c.query(`
       DO $$
       BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ledger_reason_ref_unique') THEN
+        -- Keep a single global uniqueness for ledger refs per reason
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ledger_reason_ref_unique') THEN
           ALTER TABLE public.ledger ADD CONSTRAINT ledger_reason_ref_unique UNIQUE (reason, ref);
         END IF;
 
-        -- (Optional) We do NOT add ledger_user_reason_ref_unique here to avoid redundancy.
-
-        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='withdrawals_txid_unique') THEN
+        -- WITHDRAWALS: ensure UNIQUE(txid) exists once (name may vary across envs)
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'withdrawals_txid_unique') THEN
           ALTER TABLE public.withdrawals ADD CONSTRAINT withdrawals_txid_unique UNIQUE (txid);
         END IF;
       END $$;
     `);
 
-    console.log("[bootstrap] constraints ok; (re)installing tips trigger…");
-
-    // 2) (Re)install tips pairing function(s) and trigger (idempotent)
+    // 2) Ensure FOREIGN KEYS exist (NOT VALID to avoid heavy backfill here)
+    console.log("[bootstrap] ensuring foreign keys…");
     await c.query(`
-      CREATE OR REPLACE FUNCTION public.tips_try_pair(p_ledger_id BIGINT)
-      RETURNS VOID
-      LANGUAGE plpgsql
-      AS $$
-      DECLARE
-        r_ledger RECORD;
-        match_ledger_id BIGINT;
-      BEGIN
-        SELECT id, user_id, delta_lites, created_at, reason
-          INTO r_ledger
-        FROM public.ledger
-        WHERE id = p_ledger_id;
-
-        IF NOT FOUND THEN RETURN; END IF;
-
-        IF r_ledger.reason NOT IN ('tip_out','rain_out','airdrop_out','tip_in','rain_in','airdrop_in') THEN
-          RETURN;
-        END IF;
-
-        IF r_ledger.reason IN ('tip_out','rain_out','airdrop_out') THEN
-          SELECT l.id INTO match_ledger_id
-          FROM public.ledger l
-          WHERE l.reason IN ('tip_in','rain_in','airdrop_in')
-            AND l.user_id <> r_ledger.user_id
-            AND ABS(l.delta_lites) = ABS(r_ledger.delta_lites)
-            AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes')
-                                 AND (r_ledger.created_at + INTERVAL '5 minutes')
-            AND NOT EXISTS (
-              SELECT 1 FROM public.tips t
-               WHERE t.ledger_out_id = r_ledger.id OR t.ledger_in_id = l.id
-            )
-          ORDER BY l.id ASC
-          LIMIT 1;
-          IF match_ledger_id IS NULL THEN RETURN; END IF;
-
-          INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
-          SELECT r_ledger.user_id, l.user_id, ABS(r_ledger.delta_lites),
-                 LEAST(r_ledger.created_at, l.created_at), r_ledger.id, l.id
-          FROM public.ledger l
-          WHERE l.id = match_ledger_id
-          ON CONFLICT DO NOTHING;
-
-        ELSE
-          SELECT l.id INTO match_ledger_id
-          FROM public.ledger l
-          WHERE l.reason IN ('tip_out','rain_out','airdrop_out')
-            AND l.user_id <> r_ledger.user_id
-            AND ABS(l.delta_lites) = ABS(r_ledger.delta_lites)
-            AND l.created_at BETWEEN (r_ledger.created_at - INTERVAL '5 minutes')
-                                 AND (r_ledger.created_at + INTERVAL '5 minutes')
-            AND NOT EXISTS (
-              SELECT 1 FROM public.tips t
-               WHERE t.ledger_in_id = r_ledger.id OR t.ledger_out_id = l.id
-            )
-          ORDER BY l.id ASC
-          LIMIT 1;
-          IF match_ledger_id IS NULL THEN RETURN; END IF;
-
-          INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
-          SELECT l.user_id, r_ledger.user_id, ABS(r_ledger.delta_lites),
-                 LEAST(r_ledger.created_at, l.created_at), l.id, r_ledger.id
-          FROM public.ledger l
-          WHERE l.id = match_ledger_id
-          ON CONFLICT DO NOTHING;
-        END IF;
-      END $$;
-
-      CREATE OR REPLACE FUNCTION public.tips_try_pair(p_ledger_id INTEGER)
-      RETURNS VOID
-      LANGUAGE plpgsql
-      AS $$
-      BEGIN
-        PERFORM public.tips_try_pair(p_ledger_id::BIGINT);
-      END $$;
-
-      CREATE OR REPLACE FUNCTION public.tips_trigger_fire()
-      RETURNS TRIGGER
-      LANGUAGE plpgsql
-      AS $$
-      BEGIN
-        PERFORM public.tips_try_pair(NEW.id::BIGINT);
-        RETURN NEW;
-      END $$;
-
       DO $$
       BEGIN
-        IF NOT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname = 'tips_after_insert') THEN
-          CREATE TRIGGER tips_after_insert
-          AFTER INSERT ON public.ledger
-          FOR EACH ROW EXECUTE FUNCTION public.tips_trigger_fire();
+        -- ledger.user_id -> users(id)
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='ledger_user_id_fkey') THEN
+          ALTER TABLE public.ledger
+            ADD CONSTRAINT ledger_user_id_fkey
+            FOREIGN KEY (user_id) REFERENCES public.users(id)
+            NOT VALID;
+        END IF;
+
+        -- tips.from_user_id / to_user_id -> users(id)
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='tips_from_user_fkey') THEN
+          ALTER TABLE public.tips
+            ADD CONSTRAINT tips_from_user_fkey
+            FOREIGN KEY (from_user_id) REFERENCES public.users(id)
+            NOT VALID;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='tips_to_user_fkey') THEN
+          ALTER TABLE public.tips
+            ADD CONSTRAINT tips_to_user_fkey
+            FOREIGN KEY (to_user_id) REFERENCES public.users(id)
+            NOT VALID;
+        END IF;
+
+        -- tips.ledger_out_id / ledger_in_id -> ledger(id), allow pruning via SET NULL
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='tips_ledger_out_fkey') THEN
+          ALTER TABLE public.tips
+            ADD CONSTRAINT tips_ledger_out_fkey
+            FOREIGN KEY (ledger_out_id) REFERENCES public.ledger(id)
+            ON DELETE SET NULL
+            NOT VALID;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='tips_ledger_in_fkey') THEN
+          ALTER TABLE public.tips
+            ADD CONSTRAINT tips_ledger_in_fkey
+            FOREIGN KEY (ledger_in_id) REFERENCES public.ledger(id)
+            ON DELETE SET NULL
+            NOT VALID;
         END IF;
       END $$;
     `);
 
-    console.log("[bootstrap] trigger ready; posting deposits → ledger…");
+    console.log("[bootstrap] FKs ensured; posting deposits → ledger…");
 
     // 3) Deposits → ledger (credit) idempotent
     await c.query(
@@ -206,9 +155,8 @@ async function main() {
         );
     `);
 
-    console.log("[bootstrap] withdrawals posted; pairing tips sweep…");
-
-    // 5) Pair any historical tip rows that arrived out-of-order (10-min window)
+    // 5) Historical pairing sweep (kept as a safety net; ON CONFLICT prevents dup tips)
+    console.log("[bootstrap] pairing tips sweep (10 min window) …");
     await c.query(`
       WITH outs AS (
         SELECT id, user_id, delta_lites, created_at
@@ -233,7 +181,7 @@ async function main() {
       );
     `);
 
-    console.log("[bootstrap] complete");
+    console.log("[bootstrap] complete (no DB trigger; app handles tip audit).");
   } catch (e: any) {
     if (e?.code === "25006") {
       console.warn("[bootstrap] read-only; skipping writes");
