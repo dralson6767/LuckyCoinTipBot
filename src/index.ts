@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import { rpc } from "./rpc.js";
-import { query, getBalanceLites } from "./db.js";
+import { query } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
@@ -110,67 +110,67 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// ---------- /deposit address fast path (simplified + logged) ----------
-async function getFastDepositAddress(
+// ---------- FAST BALANCE (per-user subquery + planner-friendly shape) ----------
+async function getBalanceLitesFast(userId: number): Promise<bigint> {
+  const sql = `
+    SELECT
+      u.transferred_tip_lites
+      + COALESCE((
+          SELECT SUM(l.delta_lites)
+          FROM public.ledger l
+          WHERE l.user_id = u.id
+            AND l.reason IN ('deposit','withdrawal')
+        ), 0) AS balance_lites
+    FROM public.users u
+    WHERE u.id = $1
+    LIMIT 1;
+  `;
+  const r = await query<{ balance_lites: string }>(sql, [userId]);
+  const v = r.rows[0]?.balance_lites ?? "0";
+  return BigInt(v);
+}
+
+// ---------- /deposit address: reuse same address per user ----------
+async function getOrAssignDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
-  console.log("[deposit] start", { userId, tgUserId });
-
-  // 0) reuse last address from DB if any
-  const prev = await query<{ address: string }>(
-    "SELECT address FROM public.wallet_addresses WHERE user_id = $1 ORDER BY id DESC LIMIT 1",
+  // 1) reuse stored address when present
+  const existing = await query<{ deposit_address: string | null }>(
+    "SELECT deposit_address FROM public.users WHERE id = $1",
     [userId]
   );
-  if (prev.rows[0]?.address) {
-    console.log("[deposit] reuse db addr");
-    return prev.rows[0].address;
-  }
+  const saved = existing.rows[0]?.deposit_address;
+  if (saved) return saved;
 
+  // 2) try to reuse any node address under label=tgUserId
   const label = String(tgUserId);
-  const remember = async (addr: string) => {
-    try {
-      await query(
-        `INSERT INTO public.wallet_addresses (user_id, address, label)
-         VALUES ($1,$2,$3)
-         ON CONFLICT (address) DO NOTHING`,
-        [userId, addr, label]
-      );
-    } catch (e: any) {
-      console.warn("[deposit] remember insert warn:", e?.message || e);
-    }
-    return addr;
-  };
+  let addr: string | undefined;
 
-  // Prefer straight getnewaddress with label (fast path)
-  console.log("[deposit] try getnewaddress(label)");
-  {
-    const r = await rpcTry<string>("getnewaddress", [label], 2500);
-    if (r.ok && r.value) {
-      console.log("[deposit] got address via label");
-      return remember(r.value);
-    }
-    if (!r.ok)
-      console.warn(
-        "[deposit] getnewaddress(label) ERR:",
-        r.err?.message || r.err
-      );
+  const r1 = await rpcTry<Record<string, any>>(
+    "getaddressesbylabel",
+    [label],
+    3000
+  );
+  if (r1.ok && r1.value && typeof r1.value === "object") {
+    const keys = Object.keys(r1.value);
+    if (keys.length > 0) addr = keys[0];
   }
 
-  // Fallback: getnewaddress without label (older daemons)
-  console.log("[deposit] try getnewaddress()");
-  {
-    const r = await rpcTry<string>("getnewaddress", [], 2000);
-    if (r.ok && r.value) {
-      console.log("[deposit] got address via no-arg");
-      return remember(r.value);
-    }
-    if (!r.ok)
-      console.warn("[deposit] getnewaddress() ERR:", r.err?.message || r.err);
+  // 3) if none exists, create once with label
+  if (!addr) {
+    const r2 = await rpcTry<string>("getnewaddress", [label], 3000);
+    if (r2.ok && r2.value) addr = r2.value;
   }
 
-  console.log("[deposit] failed all variants");
-  throw new Error("DEPOSIT_ADDR_FAILED");
+  if (!addr) throw new Error("DEPOSIT_ADDR_FAILED");
+
+  // 4) persist (idempotent: only when still null)
+  await query(
+    "UPDATE public.users SET deposit_address = $1 WHERE id = $2 AND deposit_address IS NULL",
+    [addr, userId]
+  );
+  return addr;
 }
 
 // ---------- health ----------
@@ -248,9 +248,9 @@ bot.command("deposit", async (ctx) => {
   console.log("[/deposit] start", ctx.from?.id, ctx.chat?.id);
   const user = await ensureUser(ctx.from);
   try {
-    // hard-cap the whole sequence so the command always replies fast
+    // hard-cap so the command always replies fast
     const addr = await withTimeout(
-      getFastDepositAddress(user.id, ctx.from.id),
+      getOrAssignDepositAddress(user.id, ctx.from.id),
       6000
     );
     const msg = `Your LKY deposit address:\n\`${addr}\``;
@@ -279,12 +279,12 @@ bot.command("deposit", async (ctx) => {
   }
 });
 
-// ----- /balance ----- (compact math)
+// ----- /balance ----- (compact + fast)
 bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await getBalanceLites(user.id); // transferred_tip_lites + deposits - withdrawals
+    const bal = await getBalanceLitesFast(user.id); // transferred_tip_lites + deposits - withdrawals
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       await tryDelete(ctx);
@@ -391,7 +391,7 @@ bot.command("tip", async (ctx) => {
   const to = await ensureUser(
     replyTo
       ? replyTo
-      : { id: targetUserId, username: unameFromCmd || undefined }
+      : { id: targetUserId!, username: unameFromCmd || undefined }
   );
 
   // do the transfer
@@ -520,7 +520,7 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  const bal = await getBalanceLites(sender.id);
+  const bal = await getBalanceLitesFast(sender.id);
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
       bal,
