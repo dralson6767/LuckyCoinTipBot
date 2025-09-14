@@ -165,9 +165,9 @@ async function getOrAssignDepositAddress(
 
   if (!addr) throw new Error("DEPOSIT_ADDR_FAILED");
 
-  // 4) persist (idempotent: only when still null)
+  // 4) persist (idempotent; never clobber a value if it appears concurrently)
   await query(
-    "UPDATE public.users SET deposit_address = $1 WHERE id = $2 AND deposit_address IS NULL",
+    "UPDATE public.users SET deposit_address = COALESCE(deposit_address, $1) WHERE id = $2",
     [addr, userId]
   );
   return addr;
@@ -243,26 +243,63 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
   return null;
 }
 
-// ----- /deposit -----
+// ===== /deposit (instant reply + cache; DM in background) =====
+const depositAddrCache = new Map<number, { addr: string; ts: number }>();
+const CACHE_MS = 10 * 60 * 1000; // 10 minutes
+
 bot.command("deposit", async (ctx) => {
   console.log("[/deposit] start", ctx.from?.id, ctx.chat?.id);
   const user = await ensureUser(ctx.from);
+
+  const replyAddr = async (addr: string) => {
+    const msg = `Your LKY deposit address:\n\`${addr}\``;
+    if (isGroup(ctx)) {
+      await tryDelete(ctx);
+      // immediate ephemeral in group
+      await ephemeralReply(ctx, msg, 12000, { parse_mode: "Markdown" });
+      // background DM (don’t block the command)
+      (async () => {
+        try {
+          await ctx.telegram.sendMessage(ctx.from.id, msg, {
+            parse_mode: "Markdown",
+          });
+        } catch {}
+      })();
+    } else {
+      await ctx.reply(msg, { parse_mode: "Markdown" });
+    }
+  };
+
   try {
-    // hard-cap so the command always replies fast
+    // 1) memory cache
+    const hit = depositAddrCache.get(user.id);
+    if (hit && Date.now() - hit.ts < CACHE_MS) {
+      await replyAddr(hit.addr);
+      console.log("[/deposit] cache hit");
+      return;
+    }
+
+    // 2) DB
+    const r1 = await query<{ deposit_address: string | null }>(
+      "SELECT deposit_address FROM public.users WHERE id = $1",
+      [user.id]
+    );
+    const saved = r1.rows[0]?.deposit_address;
+    if (saved) {
+      depositAddrCache.set(user.id, { addr: saved, ts: Date.now() });
+      await replyAddr(saved);
+      console.log("[/deposit] db hit");
+      return;
+    }
+
+    // 3) Assign (bounded RPC)
     const addr = await withTimeout(
       getOrAssignDepositAddress(user.id, ctx.from.id),
       6000
     );
-    const msg = `Your LKY deposit address:\n\`${addr}\``;
-    if (isGroup(ctx)) {
-      await tryDelete(ctx);
-      const ok = await dm(ctx, msg, { parse_mode: "Markdown" });
-      if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
-    } else {
-      await ctx.reply(msg, { parse_mode: "Markdown" });
-    }
-    console.log("[/deposit] ok");
+    depositAddrCache.set(user.id, { addr, ts: Date.now() });
+    await replyAddr(addr);
+    console.log("[/deposit] assigned");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
     const msg = isWalletBusy(e)
