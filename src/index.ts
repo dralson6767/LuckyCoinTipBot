@@ -97,8 +97,25 @@ async function botMention(ctx?: any) {
 }
 async function botDeepLink(ctx?: any, payload = "") {
   const u = await getBotUsernameEnsured(ctx);
-  return u ? `https://t.me/${u}${payload ? `?start=${payload}` : ""}` : "";
+  return u
+    ? `https://t.me/${u}${
+        payload ? `?start=${encodeURIComponent(payload)}` : ""
+      }`
+    : "";
 }
+
+// ---- HTML-safety for messages that include usernames etc. ----
+const esc = (s: any) =>
+  String(s ?? "").replace(
+    /[&<>]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]!)
+  );
+
+// Inline keyboard builder for the START button
+const startKb = (url?: string) =>
+  url
+    ? Markup.inlineKeyboard([[Markup.button.url("START LKY TIPBOT", url)]])
+    : undefined;
 
 // ---------- RPC helpers ----------
 type RpcErr = { code?: number; message?: string };
@@ -259,9 +276,24 @@ bot.start(async (ctx) => {
      WHERE id = $1`,
     [u.id, ctx.from.username || null]
   );
-  const msg = `Welcome, ${
+
+  // Deep-link payload when user came from ?start=...
+  const payload =
+    (ctx as any).startPayload || (ctx.message?.text?.split(/\s+/, 2)[1] ?? "");
+
+  if (payload && /^claim-\d{5,}$/.test(payload)) {
+    const first = ctx.from.first_name || "friend";
+    await ctx.reply(
+      `Welcome, ${esc(
+        first
+      )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
+    );
+    return;
+  }
+
+  const msg = `Welcome, ${esc(
     ctx.from.first_name || "friend"
-  }!\nUse /help for commands.`;
+  )}!\nUse /help for commands.`;
   if (isGroup(ctx)) {
     await dm(ctx, msg);
   } else {
@@ -417,8 +449,8 @@ bot.command("tip", async (ctx) => {
   parts.shift();
 
   const replyTo =
-    "reply_to_message" in ctx.message
-      ? ctx.message.reply_to_message?.from
+    "reply_to_message" in (ctx.message ?? {})
+      ? ctx.message!.reply_to_message?.from
       : undefined;
 
   // amount (last token)
@@ -459,8 +491,12 @@ bot.command("tip", async (ctx) => {
       const mention = await botMention(ctx);
       const link = await botDeepLink(ctx, `claim-${Date.now()}`);
       const msg = link
-        ? `User @${unameFromCmd} hasn’t started the bot. Ask them to tap: ${link}`
-        : `User @${unameFromCmd} hasn’t started the bot yet. Find me at ${mention}.`;
+        ? `User @${esc(
+            unameFromCmd
+          )} hasn’t started the bot. Ask them to tap: ${link}`
+        : `User @${esc(
+            unameFromCmd
+          )} hasn’t started the bot yet. Find me at ${mention}.`;
       if (isGroup(ctx)) {
         const ok = await dm(ctx, msg);
         if (!ok) await ephemeralReply(ctx, msg, 8000);
@@ -500,9 +536,10 @@ bot.command("tip", async (ctx) => {
   }
 
   const pretty = formatLky(amount, decimals);
-  const fromName = ctx.from?.username
-    ? `@${ctx.from.username}`
-    : ctx.from?.first_name || "Someone";
+  const fromName =
+    (ctx.from?.username && `@${ctx.from.username}`) ||
+    ctx.from?.first_name ||
+    "Someone";
   const toDisplay =
     (replyTo?.username && `@${replyTo.username}`) ||
     ((to as any).username && `@${(to as any).username}`) ||
@@ -518,38 +555,31 @@ bot.command("tip", async (ctx) => {
     ? await botDeepLink(ctx, `claim-${Date.now()}`)
     : "";
 
-  // 1) reply to chat immediately (with optional START button & clear text)
+  // 1) reply to chat immediately (with optional START button & clear text) — HTML parse mode
   const lines = [
-    `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
+    `💸 ${esc(fromName)} tipped ${esc(pretty)} LKY to ${esc(toDisplay)}`,
     `HODL LuckyCoin for eternal good luck! 🍀`,
   ];
   if (needsStart) {
     lines.push(
-      `👉 Credit is reserved. Press *START LKY TIPBOT* to activate your wallet and auto-claim.`
+      `👉 Credit is reserved. Press <b>START LKY TIPBOT</b> to activate your wallet and auto-claim.\n` +
+        `After opening the chat, tap the big <b>Start</b> button.`
     );
   }
-  const extra: any = { parse_mode: "Markdown" };
-  if (needsStart && deepLink) {
-    extra.reply_markup = Markup.inlineKeyboard([
-      [Markup.button.url("START LKY TIPBOT", deepLink)],
-    ]);
-  }
-  await ctx.reply(lines.join("\n"), extra);
+
+  const kb = needsStart && deepLink ? startKb(deepLink) : undefined;
+  await ctx.reply(lines.join("\n"), { parse_mode: "HTML", ...(kb ?? {}) });
   deleteAfter(ctx); // remove the command after we posted the reply
 
   // 2) background DM (non-blocking)
   const dmText = [
-    `🎉 You’ve been tipped ${pretty} LKY by ${fromName}.`,
+    `🎉 You’ve been tipped ${esc(pretty)} LKY by ${esc(fromName)}.`,
     needsStart
-      ? `Tap “START LKY TIPBOT” to activate your wallet and auto-claim.`
+      ? `Tap <b>START LKY TIPBOT</b> below, then press <b>Start</b> in the chat to activate your wallet and auto-claim.`
       : `Open the bot to view your balance.`,
   ].join("\n");
-  const dmExtra =
-    needsStart && deepLink
-      ? Markup.inlineKeyboard([
-          [Markup.button.url("START LKY TIPBOT", deepLink)],
-        ])
-      : undefined;
+
+  const dmExtra = { parse_mode: "HTML", ...(kb ?? {}) };
   dmLater(ctx, replyTo?.id ?? targetUserId!, dmText, dmExtra);
 
   console.log("[/tip] ok (non-blocking DM)");
