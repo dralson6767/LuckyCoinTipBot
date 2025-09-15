@@ -194,12 +194,10 @@ async function getBalanceLitesFast(userId: number): Promise<bigint> {
   const sql = `
     SELECT
       u.transferred_tip_lites
-      + COALESCE((
-          SELECT SUM(l.delta_lites)
-          FROM public.ledger l
-          WHERE l.user_id = u.id
-            AND l.reason IN ('deposit','withdrawal')
-        ), 0) AS balance_lites
+      + COALESCE((SELECT SUM(l.delta_lites)
+                  FROM public.ledger l
+                  WHERE l.user_id = u.id
+                    AND l.reason IN ('deposit','withdrawal')), 0) AS balance_lites
     FROM public.users u
     WHERE u.id = $1
     LIMIT 1;
@@ -269,6 +267,15 @@ bot.command("health", async (ctx) => {
 // ---------- commands ----------
 bot.start(async (ctx) => {
   const u = await ensureUser(ctx.from);
+
+  // Read previous state first (so we can decide on "(back)")
+  const prev = await query<{ has_started: boolean }>(
+    "SELECT has_started FROM public.users WHERE id = $1",
+    [u.id]
+  );
+  const wasStarted = prev.rows[0]?.has_started === true;
+
+  // Mark as started (and update username)
   await query(
     `UPDATE public.users
        SET has_started = TRUE,
@@ -283,7 +290,6 @@ bot.start(async (ctx) => {
 
   // Only the intended recipient sees the "tip credited" message.
   // Expected format: claim-<recipientTgId>-<timestamp>
-  let matched = false;
   if (payload) {
     const m = /^claim-(\d+)-(\d+)$/.exec(payload);
     if (m) {
@@ -295,14 +301,13 @@ bot.start(async (ctx) => {
             first
           )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
         );
-        matched = true;
+        return;
       }
     }
   }
-  if (matched) return;
 
   const msg = `Welcome to LuckyCoin Tipbot${
-    u.has_started ? " (back)" : ""
+    wasStarted ? " (back)" : ""
   }.\nType /help for commands.`;
   if (isGroup(ctx)) {
     await dm(ctx, msg);
