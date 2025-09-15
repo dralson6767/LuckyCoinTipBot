@@ -281,19 +281,29 @@ bot.start(async (ctx) => {
   const payload =
     (ctx as any).startPayload || (ctx.message?.text?.split(/\s+/, 2)[1] ?? "");
 
-  if (payload && /^claim-\d{5,}$/.test(payload)) {
-    const first = ctx.from.first_name || "friend";
-    await ctx.reply(
-      `Welcome, ${esc(
-        first
-      )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
-    );
-    return;
+  // Only the intended recipient sees the "tip credited" message.
+  // Expected format: claim-<recipientTgId>-<timestamp>
+  let matched = false;
+  if (payload) {
+    const m = /^claim-(\d+)-(\d+)$/.exec(payload);
+    if (m) {
+      const intendedTgId = Number(m[1]);
+      if (intendedTgId === Number(ctx.from.id)) {
+        const first = ctx.from.first_name || "friend";
+        await ctx.reply(
+          `Welcome, ${esc(
+            first
+          )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
+        );
+        matched = true;
+      }
+    }
   }
+  if (matched) return;
 
-  const msg = `Welcome, ${esc(
-    ctx.from.first_name || "friend"
-  )}!\nUse /help for commands.`;
+  const msg = `Welcome to LuckyCoin Tipbot${
+    u.has_started ? " (back)" : ""
+  }.\nType /help for commands.`;
   if (isGroup(ctx)) {
     await dm(ctx, msg);
   } else {
@@ -551,11 +561,14 @@ bot.command("tip", async (ctx) => {
     [to.id]
   );
   const needsStart = needStartRow.rows[0]?.has_started === true ? false : true;
+
+  // Deep link encodes the intended recipient's Telegram ID
+  const recipientTgId = replyTo?.id ?? targetUserId!;
   const deepLink = needsStart
-    ? await botDeepLink(ctx, `claim-${Date.now()}`)
+    ? await botDeepLink(ctx, `claim-${recipientTgId}-${Date.now()}`)
     : "";
 
-  // 1) reply to chat immediately (with optional START button & clear text) — HTML parse mode
+  // 1) reply to chat immediately (with optional START button) — HTML parse mode
   const lines = [
     `💸 ${esc(fromName)} tipped ${esc(pretty)} LKY to ${esc(toDisplay)}`,
     `HODL LuckyCoin for eternal good luck! 🍀`,
@@ -568,7 +581,9 @@ bot.command("tip", async (ctx) => {
   }
 
   const kb = needsStart && deepLink ? startKb(deepLink) : undefined;
-  await ctx.reply(lines.join("\n"), { parse_mode: "HTML", ...(kb ?? {}) });
+  const extra: any = { parse_mode: "HTML" };
+  if (kb) extra.reply_markup = kb.reply_markup;
+  await ctx.reply(lines.join("\n"), extra);
   deleteAfter(ctx); // remove the command after we posted the reply
 
   // 2) background DM (non-blocking)
@@ -578,9 +593,9 @@ bot.command("tip", async (ctx) => {
       ? `Tap <b>START LKY TIPBOT</b> below, then press <b>Start</b> in the chat to activate your wallet and auto-claim.`
       : `Open the bot to view your balance.`,
   ].join("\n");
-
-  const dmExtra = { parse_mode: "HTML", ...(kb ?? {}) };
-  dmLater(ctx, replyTo?.id ?? targetUserId!, dmText, dmExtra);
+  const dmExtra: any = { parse_mode: "HTML" };
+  if (kb) dmExtra.reply_markup = kb.reply_markup;
+  dmLater(ctx, recipientTgId, dmText, dmExtra);
 
   console.log("[/tip] ok (non-blocking DM)");
 });
