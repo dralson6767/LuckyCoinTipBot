@@ -15,7 +15,7 @@ const bot = new Telegraf(botToken);
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
-// delete user command after we successfully replied (so it never “vanishes”)
+// delete the user's command only AFTER we replied (so it never “vanishes”)
 const deleteAfter = (ctx: any) => {
   try {
     if (isGroup(ctx) && ctx.message) ctx.deleteMessage().catch(() => {});
@@ -45,7 +45,7 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
   }
 };
 
-// background DM with flood-wait retry + logging
+// background DM with flood-wait retry + logging (never blocks handlers)
 async function dmLater(
   ctx: any,
   chatId: number,
@@ -152,11 +152,10 @@ async function ensureSetup() {
     `CREATE INDEX IF NOT EXISTS idx_users_has_started ON public.users(has_started);`
   );
 
-  // for /balance scans
+  // balance speed indexes
   await query(
     `CREATE INDEX IF NOT EXISTS idx_ledger_user_reason ON public.ledger(user_id, reason);`
   ).catch(() => {});
-  // partial covering (fallback if INCLUDE unsupported)
   try {
     await query(
       `CREATE INDEX IF NOT EXISTS idx_ledger_bal_fast
@@ -407,7 +406,7 @@ bot.command("balance", async (ctx) => {
   }
 });
 
-// ----- /tip ----- (group reply first; START button only if needed; DM in bg)
+// ----- /tip ----- (group reply first; START button if needed; DM in bg)
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
@@ -519,14 +518,14 @@ bot.command("tip", async (ctx) => {
     ? await botDeepLink(ctx, `claim-${Date.now()}`)
     : "";
 
-  // 1) reply to chat (with optional START button & instruction)
+  // 1) reply to chat immediately (with optional START button & clear text)
   const lines = [
     `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
     `HODL LuckyCoin for eternal good luck! 🍀`,
   ];
   if (needsStart) {
     lines.push(
-      `👉 Press *START LKY TIPBOT* to activate your wallet and claim it.`
+      `👉 Credit is reserved. Press *START LKY TIPBOT* to activate your wallet and auto-claim.`
     );
   }
   const extra: any = { parse_mode: "Markdown" };
@@ -536,13 +535,13 @@ bot.command("tip", async (ctx) => {
     ]);
   }
   await ctx.reply(lines.join("\n"), extra);
-  deleteAfter(ctx); // remove the user's /tip command now that reply is posted
+  deleteAfter(ctx); // remove the command after we posted the reply
 
-  // 2) background DM
+  // 2) background DM (non-blocking)
   const dmText = [
     `🎉 You’ve been tipped ${pretty} LKY by ${fromName}.`,
     needsStart
-      ? `Tap “START LKY TIPBOT” to activate your wallet and claim it.`
+      ? `Tap “START LKY TIPBOT” to activate your wallet and auto-claim.`
       : `Open the bot to view your balance.`,
   ].join("\n");
   const dmExtra =
