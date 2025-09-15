@@ -306,9 +306,10 @@ bot.start(async (ctx) => {
     }
   }
 
-  const msg = `Welcome to LuckyCoin Tipbot${
-    wasStarted ? " (back)" : ""
-  }.\nType /help for commands.`;
+  const msg = wasStarted
+    ? `Welcome back to LuckyCoin Tipbot.\nType /help for commands.`
+    : `Welcome to LuckyCoin Tipbot.\nType /help for commands.`;
+
   if (isGroup(ctx)) {
     await dm(ctx, msg);
   } else {
