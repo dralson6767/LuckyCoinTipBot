@@ -15,7 +15,7 @@ const bot = new Telegraf(botToken);
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
-// fire-and-forget delete (never blocks the update loop)
+// fire-and-forget delete (never blocks)
 const tryDelete = (ctx: any) => {
   try {
     if (isGroup(ctx) && ctx.message) ctx.deleteMessage().catch(() => {});
@@ -45,7 +45,7 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
   }
 };
 
-// background DM with flood-wait retry, non-blocking
+// background DM with flood-wait retry
 async function dmLater(
   ctx: any,
   chatId: number,
@@ -58,18 +58,39 @@ async function dmLater(
     } catch (e: any) {
       const retry = e?.parameters?.retry_after;
       if (retry) {
-        setTimeout(() => {
-          ctx.telegram.sendMessage(chatId, text, extra).catch(() => {});
-        }, (retry + 1) * 1000);
+        setTimeout(
+          () => ctx.telegram.sendMessage(chatId, text, extra).catch(() => {}),
+          (retry + 1) * 1000
+        );
       }
     }
   })();
 }
 
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
-let BOT_AT = "@";
-const getBotAt = () => BOT_AT;
-const getBotUsername = () => (BOT_AT.startsWith("@") ? BOT_AT.slice(1) : "");
+
+// Resolve bot username reliably (fallback to env BOT_USERNAME)
+let BOT_USER = "";
+async function getBotUsernameEnsured(ctx?: any): Promise<string> {
+  if (BOT_USER) return BOT_USER;
+  try {
+    const me = await bot.telegram.getMe();
+    BOT_USER = me?.username || "";
+  } catch {}
+  if (!BOT_USER && (ctx as any)?.me?.username)
+    BOT_USER = (ctx as any).me.username;
+  if (!BOT_USER && process.env.BOT_USERNAME)
+    BOT_USER = String(process.env.BOT_USERNAME).replace(/^@/, "");
+  return BOT_USER;
+}
+async function botMention(ctx?: any) {
+  const u = await getBotUsernameEnsured(ctx);
+  return u ? `@${u}` : "@";
+}
+async function botDeepLink(ctx?: any, payload = "") {
+  const u = await getBotUsernameEnsured(ctx);
+  return u ? `https://t.me/${u}${payload ? `?start=${payload}` : ""}` : "";
+}
 
 // ---------- RPC helpers ----------
 type RpcErr = { code?: number; message?: string };
@@ -98,12 +119,10 @@ async function rpcTry<T>(
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Hard timeout wrapper so /deposit always answers
+// Hard timeout helper
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("DEPOSIT_TIMEOUT")), ms);
+    const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
     p.then(
       (v) => {
         clearTimeout(t);
@@ -117,7 +136,37 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// ---------- FAST BALANCE (per-user subquery + planner-friendly shape) ----------
+// ---------- one-time setup: schema + indexes for speed ----------
+async function ensureSetup() {
+  // track if a user has actually started the bot
+  await query(
+    `ALTER TABLE public.users ADD COLUMN IF NOT EXISTS has_started boolean DEFAULT false NOT NULL;`
+  );
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_users_has_started ON public.users(has_started);`
+  );
+
+  // indexes to make /balance instantaneous
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_ledger_user_reason ON public.ledger(user_id, reason);`
+  ).catch(() => {});
+  // partial covering index (fallback if INCLUDE not supported)
+  try {
+    await query(
+      `CREATE INDEX IF NOT EXISTS idx_ledger_bal_fast
+         ON public.ledger(user_id) INCLUDE (delta_lites)
+       WHERE reason IN ('deposit','withdrawal');`
+    );
+  } catch {
+    await query(
+      `CREATE INDEX IF NOT EXISTS idx_ledger_bal_fast_fb
+         ON public.ledger(user_id, reason, delta_lites);`
+    );
+  }
+  await query(`ANALYZE public.ledger;`).catch(() => {});
+}
+
+// ---------- FAST BALANCE ----------
 async function getBalanceLitesFast(userId: number): Promise<bigint> {
   const sql = `
     SELECT
@@ -137,12 +186,11 @@ async function getBalanceLitesFast(userId: number): Promise<bigint> {
   return BigInt(v);
 }
 
-// ---------- /deposit address: reuse same address per user ----------
+// ---------- deposit address (reuse) ----------
 async function getOrAssignDepositAddress(
   userId: number,
   tgUserId: number
 ): Promise<string> {
-  // 1) reuse stored address when present
   const existing = await query<{ deposit_address: string | null }>(
     "SELECT deposit_address FROM public.users WHERE id = $1",
     [userId]
@@ -150,7 +198,6 @@ async function getOrAssignDepositAddress(
   const saved = existing.rows[0]?.deposit_address;
   if (saved) return saved;
 
-  // 2) try to reuse any node address under label=tgUserId
   const label = String(tgUserId);
   let addr: string | undefined;
 
@@ -163,16 +210,12 @@ async function getOrAssignDepositAddress(
     const keys = Object.keys(r1.value);
     if (keys.length > 0) addr = keys[0];
   }
-
-  // 3) if none exists, create once with label
   if (!addr) {
     const r2 = await rpcTry<string>("getnewaddress", [label], 3000);
     if (r2.ok && r2.value) addr = r2.value;
   }
-
   if (!addr) throw new Error("DEPOSIT_ADDR_FAILED");
 
-  // 4) persist (idempotent; never clobber if set concurrently)
   await query(
     "UPDATE public.users SET deposit_address = COALESCE(deposit_address, $1) WHERE id = $2",
     [addr, userId]
@@ -202,7 +245,13 @@ bot.command("health", async (ctx) => {
 
 // ---------- commands ----------
 bot.start(async (ctx) => {
-  await ensureUser(ctx.from);
+  const u = await ensureUser(ctx.from);
+  // mark that this user has actually started the bot
+  await query(
+    `UPDATE public.users SET has_started = TRUE, username = COALESCE($2, username)
+     WHERE id = $1`,
+    [u.id, ctx.from.username || null]
+  );
   const msg = `Welcome, ${
     ctx.from.first_name || "friend"
   }!\nUse /help for commands.`;
@@ -215,21 +264,26 @@ bot.start(async (ctx) => {
 });
 
 bot.help(async (ctx) => {
+  const mention = await botMention(ctx);
+  const link = await botDeepLink(ctx);
   const text = [
     "*Commands*",
     "/deposit — get your LKY deposit address",
     "/balance — show your internal balance",
     "/tip — reply with `/tip 1.23` or `/tip @username 1.23`",
     "/withdraw <address> <amount> — withdraw on-chain",
-    isGroup(ctx)
-      ? "\n*Tip:* Use /deposit, /balance, /withdraw in DM for privacy."
-      : "",
+    isGroup(ctx) && link ? `\n*Tip:* Use me in DM for privacy: ${mention}` : "",
   ].join("\n");
   if (isGroup(ctx)) {
     tryDelete(ctx);
     const ok = await dm(ctx, text, { parse_mode: "Markdown" });
-    if (!ok)
-      await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+    if (!ok) {
+      await ephemeralReply(
+        ctx,
+        link ? `Please DM me first: ${mention}` : "Please DM me first.",
+        6000
+      );
+    }
   } else {
     await ctx.reply(text, { parse_mode: "Markdown" });
   }
@@ -243,7 +297,7 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
   try {
     const chat = await ctx.telegram.getChat("@" + uname);
     if (chat?.id) {
-      await ensureUser({ id: chat.id, username: uname }); // persist minimal
+      await ensureUser({ id: chat.id, username: uname }); // persist minimal (doesn't mean "started")
       return Number(chat.id);
     }
   } catch {}
@@ -262,11 +316,7 @@ bot.command("deposit", async (ctx) => {
     const msg = `Your LKY deposit address:\n\`${addr}\``;
     if (isGroup(ctx)) {
       tryDelete(ctx);
-      // immediate ephemeral in group
-      await ephemeralReply(ctx, msg, 12000, {
-        parse_mode: "Markdown",
-      });
-      // background DM (non-blocking)
+      await ephemeralReply(ctx, msg, 12000, { parse_mode: "Markdown" });
       dmLater(ctx, ctx.from.id, msg, { parse_mode: "Markdown" });
     } else {
       await ctx.reply(msg, { parse_mode: "Markdown" });
@@ -274,7 +324,6 @@ bot.command("deposit", async (ctx) => {
   };
 
   try {
-    // 1) memory cache
     const hit = depositAddrCache.get(user.id);
     if (hit && Date.now() - hit.ts < CACHE_MS) {
       await replyAddr(hit.addr);
@@ -282,7 +331,6 @@ bot.command("deposit", async (ctx) => {
       return;
     }
 
-    // 2) DB
     const r1 = await query<{ deposit_address: string | null }>(
       "SELECT deposit_address FROM public.users WHERE id = $1",
       [user.id]
@@ -295,7 +343,6 @@ bot.command("deposit", async (ctx) => {
       return;
     }
 
-    // 3) Assign (bounded RPC)
     const addr = await withTimeout(
       getOrAssignDepositAddress(user.id, ctx.from.id),
       6000
@@ -305,6 +352,8 @@ bot.command("deposit", async (ctx) => {
     console.log("[/deposit] assigned");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
+    const mention = await botMention(ctx);
+    const link = await botDeepLink(ctx);
     const msg = isWalletBusy(e)
       ? "Wallet is busy. Try /deposit again in a minute."
       : "Wallet temporarily unavailable. Try /deposit again shortly.";
@@ -312,7 +361,11 @@ bot.command("deposit", async (ctx) => {
       tryDelete(ctx);
       const ok = await dm(ctx, msg);
       if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+        await ephemeralReply(
+          ctx,
+          link ? `Please DM me first: ${mention}` : "Please DM me first.",
+          6000
+        );
     } else {
       await ctx.reply(msg);
     }
@@ -324,13 +377,20 @@ bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await getBalanceLitesFast(user.id); // transferred_tip_lites + deposits - withdrawals
+    const bal = await getBalanceLitesFast(user.id);
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       tryDelete(ctx);
       const ok = await dm(ctx, text);
-      if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+      if (!ok) {
+        const mention = await botMention(ctx);
+        const link = await botDeepLink(ctx);
+        await ephemeralReply(
+          ctx,
+          link ? `Please DM me first: ${mention}` : "Please DM me first.",
+          6000
+        );
+      }
     } else {
       await ctx.reply(text);
     }
@@ -345,11 +405,10 @@ bot.command("balance", async (ctx) => {
   }
 });
 
-// ----- /tip -----  (instant group reply; DM in background with start button)
+// ----- /tip -----  (instant group reply; DM in background; show Start only if needed)
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
-  // keep sender fresh (captures username changes)
   const from = await ensureUser(ctx.from);
 
   const text = ctx.message?.text || "";
@@ -361,7 +420,7 @@ bot.command("tip", async (ctx) => {
       ? ctx.message.reply_to_message?.from
       : undefined;
 
-  // parse amount (last token)
+  // amount (last token)
   const amountStr = parts[parts.length - 1];
   if (!amountStr) {
     await ephemeralReply(
@@ -385,25 +444,22 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // determine recipient
+  // resolve recipient
   let targetUserId: number | null = null;
   let unameFromCmd: string | null = null;
 
   if (replyTo?.id) {
     targetUserId = Number(replyTo.id);
-    // keep DB fresh for replied users
     await ensureUser(replyTo);
   } else if (parts.length >= 2 && parts[0].startsWith("@")) {
     unameFromCmd = parts[0].slice(1);
     targetUserId = await resolveUserIdByUsername(ctx, unameFromCmd);
     if (!targetUserId) {
-      const botUser = getBotUsername();
-      const deepLink = botUser
-        ? `https://t.me/${botUser}?start=claim-${Date.now()}`
-        : "";
-      const msg = deepLink
-        ? `User @${unameFromCmd} hasn’t started the bot. Ask them to tap: ${deepLink}`
-        : `User @${unameFromCmd} hasn’t started the bot yet.`;
+      const mention = await botMention(ctx);
+      const link = await botDeepLink(ctx, `claim-${Date.now()}`);
+      const msg = link
+        ? `User @${unameFromCmd} hasn’t started the bot. Ask them to tap: ${link}`
+        : `User @${unameFromCmd} hasn’t started the bot yet. Find me at ${mention}.`;
       if (isGroup(ctx)) {
         tryDelete(ctx);
         const ok = await dm(ctx, msg);
@@ -427,14 +483,14 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // ensure recipient exists (update username if we know it)
+  // ensure recipient exists
   const to = await ensureUser(
     replyTo
       ? replyTo
       : { id: targetUserId!, username: unameFromCmd || undefined }
   );
 
-  // do the transfer
+  // perform transfer
   try {
     await transfer(from.id, to.id, amount);
   } catch (e: any) {
@@ -445,63 +501,60 @@ bot.command("tip", async (ctx) => {
 
   const pretty = formatLky(amount, decimals);
 
-  // display names
   const fromName = ctx.from?.username
     ? `@${ctx.from.username}`
     : ctx.from?.first_name || "Someone";
-
   const toDisplay =
     (replyTo?.username && `@${replyTo.username}`) ||
     ((to as any).username && `@${(to as any).username}`) ||
     (unameFromCmd ? `@${unameFromCmd}` : `user ${to.id}`);
 
-  // deep link to force-start the bot (recipients who never started will need this)
-  const botUser = getBotUsername();
-  const deepLink = botUser
-    ? `https://t.me/${botUser}?start=claim-${Date.now()}`
+  // does recipient need to "Start"?
+  const needStartRow = await query<{ has_started: boolean }>(
+    "SELECT has_started FROM public.users WHERE id = $1",
+    [to.id]
+  );
+  const needsStart = needStartRow.rows[0]?.has_started === true ? false : true;
+
+  const deepLink = needsStart
+    ? await botDeepLink(ctx, `claim-${Date.now()}`)
     : "";
 
-  // 1) Reply to the chat immediately (non-blocking; include Start button)
+  // 1) reply to chat immediately (include Start button only if needed)
   if (isGroup(ctx)) {
     tryDelete(ctx);
-    await ctx.reply(
-      [
-        `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
-        `HODL LuckyCoin for eternal good luck! 🍀`,
-      ].join("\n"),
-      deepLink
-        ? {
-            parse_mode: "Markdown",
-            ...Markup.inlineKeyboard([
-              [Markup.button.url("Start bot to claim", deepLink)],
-            ]),
-          }
-        : { parse_mode: "Markdown" }
-    );
+    const lines = [
+      `💸 ${fromName} tipped ${pretty} LKY to ${toDisplay}`,
+      `HODL LuckyCoin for eternal good luck! 🍀`,
+    ];
+    const extra: any = { parse_mode: "Markdown" };
+    if (needsStart && deepLink) {
+      extra.reply_markup = Markup.inlineKeyboard([
+        [Markup.button.url("Start bot to claim", deepLink)],
+      ]);
+    }
+    await ctx.reply(lines.join("\n"), extra);
   } else {
     await ctx.reply(`Sent ${pretty} LKY to ${toDisplay}`);
   }
 
-  // 2) DM the recipient in the background (will fail silently if they haven't started)
+  // 2) background DM (if they already started, they'll receive it; if not, Telegram will reject silently)
   const dmText = [
     `🎉 You’ve been tipped ${pretty} LKY by ${fromName}.`,
-    `Tap “Start” to activate your wallet and claim it.`,
+    needsStart
+      ? `Tap “Start” to activate your wallet and claim it.`
+      : `Open the bot to view your balance.`,
   ].join("\n");
-  if (deepLink) {
-    dmLater(
-      ctx,
-      replyTo?.id ?? targetUserId!,
-      dmText,
-      Markup.inlineKeyboard([[Markup.button.url("Start the bot", deepLink)]])
-    );
-  } else {
-    dmLater(ctx, replyTo?.id ?? targetUserId!, dmText);
-  }
+  const dmExtra =
+    needsStart && deepLink
+      ? Markup.inlineKeyboard([[Markup.button.url("Start the bot", deepLink)]])
+      : undefined;
+  dmLater(ctx, replyTo?.id ?? targetUserId!, dmText, dmExtra);
 
   console.log("[/tip] ok (non-blocking DM)");
 });
 
-// ----- /withdraw ----- (compact balance check)
+// ----- /withdraw -----
 bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] start");
   const sender = await ensureUser(ctx.from);
@@ -511,12 +564,18 @@ bot.command("withdraw", async (ctx) => {
   parts.shift();
 
   if (parts.length < 2) {
+    const mention = await botMention(ctx);
+    const link = await botDeepLink(ctx);
     const msg = "Usage: /withdraw <address> <amount>";
     if (isGroup(ctx)) {
       tryDelete(ctx);
       const ok = await dm(ctx, msg);
       if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+        await ephemeralReply(
+          ctx,
+          link ? `Please DM me first: ${mention}` : "Please DM me first.",
+          6000
+        );
     } else {
       await ctx.reply(msg);
     }
@@ -532,8 +591,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       tryDelete(ctx);
       const ok = await dm(ctx, msg);
-      if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -544,8 +602,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       tryDelete(ctx);
       const ok = await dm(ctx, msg);
-      if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -561,8 +618,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       tryDelete(ctx);
       const ok = await dm(ctx, msg);
-      if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -575,8 +631,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       tryDelete(ctx);
       const ok = await dm(ctx, msg);
-      if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -605,8 +660,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       tryDelete(ctx);
       const ok = await dm(ctx, msg);
-      if (!ok)
-        await ephemeralReply(ctx, `Please DM me first: ${getBotAt()}`, 6000);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -647,12 +701,9 @@ bot.command("withdraw", async (ctx) => {
 bot.catch((err) => console.error("Bot error", err));
 
 bot.launch().then(async () => {
-  try {
-    const me = await bot.telegram.getMe();
-    BOT_AT = me?.username ? `@${me.username}` : "@";
-  } catch {
-    BOT_AT = "@";
-  }
+  await ensureSetup(); // indexes + has_started column
+  // also warm BOT_USER
+  await getBotUsernameEnsured();
   console.log("Tipbot is running.");
 });
 
