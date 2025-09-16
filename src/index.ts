@@ -207,6 +207,21 @@ async function getBalanceLitesFast(userId: number): Promise<bigint> {
   return BigInt(v);
 }
 
+// ===== Small balance cache (instant /balance + explicit invalidation) =====
+const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
+const balanceCache = new Map<number, { bal: bigint; ts: number }>();
+
+async function getBalanceCached(userId: number): Promise<bigint> {
+  const hit = balanceCache.get(userId);
+  if (hit && Date.now() - hit.ts < BAL_CACHE_MS) return hit.bal;
+  const bal = await getBalanceLitesFast(userId);
+  balanceCache.set(userId, { bal, ts: Date.now() });
+  return bal;
+}
+function invalidateBalance(...userIds: number[]) {
+  for (const id of userIds) balanceCache.delete(id);
+}
+
 // ---------- deposit address (reuse) ----------
 async function getOrAssignDepositAddress(
   userId: number,
@@ -268,7 +283,7 @@ bot.command("health", async (ctx) => {
 bot.start(async (ctx) => {
   const u = await ensureUser(ctx.from);
 
-  // Read previous state first (so we can decide on "(back)")
+  // Read previous state first (so we can say "Welcome back")
   const prev = await query<{ has_started: boolean }>(
     "SELECT has_started FROM public.users WHERE id = $1",
     [u.id]
@@ -427,7 +442,7 @@ bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUser(ctx.from);
-    const bal = await getBalanceLitesFast(user.id);
+    const bal = await getBalanceCached(user.id); // <- cached
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       const ok = await dm(ctx, text);
@@ -545,6 +560,7 @@ bot.command("tip", async (ctx) => {
   // perform transfer
   try {
     await transfer(from.id, to.id, amount);
+    invalidateBalance(from.id, to.id); // <- bust cache after tip
   } catch (e: any) {
     console.error("[/tip] ERR", e?.message || e);
     await ephemeralReply(ctx, `Tip failed: ${e.message}`, 6000);
@@ -658,7 +674,7 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  const bal = await getBalanceLitesFast(sender.id);
+  const bal = await getBalanceCached(sender.id); // cached read is fine
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
       bal,
@@ -728,6 +744,7 @@ bot.command("withdraw", async (ctx) => {
 
   try {
     await debit(sender.id, amount, "withdrawal", txid);
+    invalidateBalance(sender.id); // <- bust cache after withdraw
   } catch (e: any) {
     console.error("[/withdraw] debit ledger ERR:", e?.message || e);
   }
