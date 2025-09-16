@@ -11,6 +11,18 @@ const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 const bot = new Telegraf(botToken);
 
+// ---------- perf knobs ----------
+const RESOLVE_USERNAME_TIMEOUT_MS = Number(
+  process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
+);
+const USERNAME_CACHE_MS = Number(process.env.USERNAME_CACHE_MS ?? "1200000"); // 20 min
+const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
+const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
+
+// tiny cache for @username → tg id
+type CacheHit = { id: number; ts: number };
+const unameCache = new Map<string, CacheHit>();
+
 // ---------- helpers ----------
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
@@ -74,8 +86,6 @@ async function dmLater(
     }
   })();
 }
-
-const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 
 // Resolve bot username reliably (fallback to env BOT_USERNAME)
 let BOT_USER = "";
@@ -208,7 +218,6 @@ async function getBalanceLitesFast(userId: number): Promise<bigint> {
 }
 
 // ===== Small balance cache (instant /balance + explicit invalidation) =====
-const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
 const balanceCache = new Map<number, { bal: bigint; ts: number }>();
 
 async function getBalanceCached(userId: number): Promise<bigint> {
@@ -356,18 +365,42 @@ bot.help(async (ctx) => {
   }
 });
 
-// ---------- resolve @username not in DB ----------
+// ---------- fast @username resolution ----------
+type TgChatMinimal = { id?: number; username?: string };
+
 async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
   const uname = unameRaw.replace(/^@/, "");
+  const key = uname.toLowerCase();
+
+  // 1) tiny cache
+  const hit = unameCache.get(key);
+  if (hit && Date.now() - hit.ts < USERNAME_CACHE_MS) return hit.id;
+
+  // 2) DB first (use stored function)
   const inDb = await findUserByUsername(uname);
-  if (inDb) return Number(inDb.tg_user_id);
+  if (inDb) {
+    const id = Number(inDb.tg_user_id);
+    unameCache.set(key, { id, ts: Date.now() });
+    return id;
+  }
+
+  // 3) Telegram getChat with short timeout (avoid long stalls)
   try {
-    const chat = await ctx.telegram.getChat("@" + uname);
-    if (chat?.id) {
-      await ensureUser({ id: chat.id, username: uname }); // persist minimal (not "started")
-      return Number(chat.id);
+    const chat = (await withTimeout(
+      ctx.telegram.getChat("@" + uname) as Promise<any>,
+      RESOLVE_USERNAME_TIMEOUT_MS
+    )) as TgChatMinimal;
+
+    if (chat?.id != null) {
+      await ensureUser({ id: chat.id, username: uname } as any); // persist minimal
+      const id = Number(chat.id);
+      unameCache.set(key, { id, ts: Date.now() });
+      return id;
     }
-  } catch {}
+  } catch {
+    // timeout or error → fall through
+  }
+
   return null;
 }
 
@@ -469,7 +502,7 @@ bot.command("balance", async (ctx) => {
   }
 });
 
-// ----- /tip ----- (group reply first; START button if needed; DM in bg)
+// ----- /tip ----- (optimized: fewer sequential awaits; fast username resolve)
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
@@ -508,7 +541,7 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // resolve recipient
+  // resolve recipient (fast path for reply, otherwise cached username resolve)
   let targetUserId: number | null = null;
   let unameFromCmd: string | null = null;
 
@@ -516,17 +549,17 @@ bot.command("tip", async (ctx) => {
     targetUserId = Number(replyTo.id);
     await ensureUser(replyTo);
   } else if (parts.length >= 2 && parts[0].startsWith("@")) {
-    unameFromCmd = parts[0].slice(1);
+    unameFromCmd = parts[0];
     targetUserId = await resolveUserIdByUsername(ctx, unameFromCmd);
     if (!targetUserId) {
       const mention = await botMention(ctx);
       const link = await botDeepLink(ctx, `claim-${Date.now()}`);
       const msg = link
         ? `User @${esc(
-            unameFromCmd
+            unameFromCmd.replace(/^@/, "")
           )} hasn’t started the bot. Ask them to tap: ${link}`
         : `User @${esc(
-            unameFromCmd
+            unameFromCmd.replace(/^@/, "")
           )} hasn’t started the bot yet. Find me at ${mention}.`;
       if (isGroup(ctx)) {
         const ok = await dm(ctx, msg);
@@ -550,17 +583,40 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // ensure recipient exists
-  const to = await ensureUser(
-    replyTo
-      ? replyTo
-      : { id: targetUserId!, username: unameFromCmd || undefined }
-  );
+  // ensure recipient exists (if not from replyTo branch)
+  const to = replyTo
+    ? await ensureUser(replyTo)
+    : await ensureUser({
+        id: targetUserId!,
+        username: unameFromCmd?.replace(/^@/, "") || undefined,
+      });
 
-  // perform transfer
+  // --- perform transfer & fetch has_started in parallel ---
+  let needsStart = false;
   try {
-    await transfer(from.id, to.id, amount);
-    invalidateBalance(from.id, to.id); // <- bust cache after tip
+    const xferP = transfer(from.id, to.id, amount);
+    const startedP = query<{ has_started: boolean }>(
+      "SELECT has_started FROM public.users WHERE id = $1",
+      [to.id]
+    );
+
+    const [xferRes, startedRes] = await Promise.allSettled([xferP, startedP]);
+
+    if (xferRes.status === "rejected") {
+      const e = xferRes.reason as any;
+      console.error("[/tip] ERR", e?.message || e);
+      await ephemeralReply(ctx, `Tip failed: ${e?.message || e}`, 6000);
+      return;
+    }
+
+    invalidateBalance(from.id, to.id);
+
+    if (startedRes.status === "fulfilled") {
+      needsStart =
+        startedRes.value.rows[0]?.has_started === true ? false : true;
+    } else {
+      needsStart = false;
+    }
   } catch (e: any) {
     console.error("[/tip] ERR", e?.message || e);
     await ephemeralReply(ctx, `Tip failed: ${e.message}`, 6000);
@@ -575,16 +631,9 @@ bot.command("tip", async (ctx) => {
   const toDisplay =
     (replyTo?.username && `@${replyTo.username}`) ||
     ((to as any).username && `@${(to as any).username}`) ||
-    (unameFromCmd ? `@${unameFromCmd}` : `user ${to.id}`);
+    (unameFromCmd ? unameFromCmd : `user ${to.id}`);
 
-  // does recipient need to "Start"?
-  const needStartRow = await query<{ has_started: boolean }>(
-    "SELECT has_started FROM public.users WHERE id = $1",
-    [to.id]
-  );
-  const needsStart = needStartRow.rows[0]?.has_started === true ? false : true;
-
-  // Deep link encodes the intended recipient's Telegram ID
+  // Deep link encodes the intended recipient's Telegram ID if they haven't started yet
   const recipientTgId = replyTo?.id ?? targetUserId!;
   const deepLink = needsStart
     ? await botDeepLink(ctx, `claim-${recipientTgId}-${Date.now()}`)
@@ -606,14 +655,14 @@ bot.command("tip", async (ctx) => {
   const extra: any = { parse_mode: "HTML" };
   if (kb) extra.reply_markup = kb.reply_markup;
   await ctx.reply(lines.join("\n"), extra);
-  deleteAfter(ctx); // remove the command after we posted the reply
+  deleteAfter(ctx);
 
   // 2) background DM (non-blocking)
   const dmText = [
     `🎉 You’ve been tipped ${esc(pretty)} LKY by ${esc(fromName)}.`,
     needsStart
       ? `Tap <b>START LKY TIPBOT</b> below, then press <b>Start</b> in the chat to activate your wallet and auto-claim.`
-      : `Open the bot to view your balance.`,
+      : `Check your holdings with /balance.`,
   ].join("\n");
   const dmExtra: any = { parse_mode: "HTML" };
   if (kb) dmExtra.reply_markup = kb.reply_markup;
