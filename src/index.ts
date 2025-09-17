@@ -336,9 +336,11 @@ bot.command("health", async (ctx) => {
 
 // ---------- commands ----------
 bot.start(async (ctx) => {
+  // ensure user exists (hot-path cached)
   const u = await ensureUserCached(ctx.from);
   const newUname = ctx.from.username || null;
 
+  // one round-trip: read previous + update only if needed
   const sql = `
     WITH prev AS (
       SELECT id, has_started, username
@@ -368,6 +370,7 @@ bot.start(async (ctx) => {
   ]);
   const wasStarted = r.rows[0]?.was_started === true;
 
+  // Deep-link payload when user came from ?start=...
   const payload =
     (ctx as any).startPayload || (ctx.message?.text?.split(/\s+/, 2)[1] ?? "");
   if (payload) {
@@ -379,6 +382,7 @@ bot.start(async (ctx) => {
           first
         )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
       );
+      if (isGroup(ctx)) deleteAfter(ctx); // <- delete /start command in groups
       return;
     }
   }
@@ -387,10 +391,11 @@ bot.start(async (ctx) => {
     ? `Welcome back to LuckyCoin Tipbot.\nType /help for commands.`
     : `Welcome to LuckyCoin Tipbot.\nType /help for commands.`;
 
-  if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
-    await dm(ctx, msg);
+  if (isGroup(ctx)) {
+    await dm(ctx, msg); // reply in DM for privacy
+    deleteAfter(ctx); // <- always delete the /start in group
   } else {
-    await ctx.reply(msg);
+    await ctx.reply(msg); // normal DM chat
   }
 });
 
