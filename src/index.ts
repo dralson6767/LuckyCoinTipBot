@@ -336,11 +336,9 @@ bot.command("health", async (ctx) => {
 
 // ---------- commands ----------
 bot.start(async (ctx) => {
-  // ensure user exists (hot-path cached)
   const u = await ensureUserCached(ctx.from);
   const newUname = ctx.from.username || null;
 
-  // one round-trip: read previous + update only if needed
   const sql = `
     WITH prev AS (
       SELECT id, has_started, username
@@ -370,25 +368,18 @@ bot.start(async (ctx) => {
   ]);
   const wasStarted = r.rows[0]?.was_started === true;
 
-  // Deep-link payload when user came from ?start=...
   const payload =
     (ctx as any).startPayload || (ctx.message?.text?.split(/\s+/, 2)[1] ?? "");
-
-  // Only the intended recipient sees the "tip credited" message.
-  // Expected format: claim-<recipientTgId>-<timestamp>
   if (payload) {
     const m = /^claim-(\d+)-(\d+)$/.exec(payload);
-    if (m) {
-      const intendedTgId = Number(m[1]);
-      if (intendedTgId === Number(ctx.from.id)) {
-        const first = ctx.from.first_name || "friend";
-        await ctx.reply(
-          `Welcome, ${esc(
-            first
-          )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
-        );
-        return;
-      }
+    if (m && Number(m[1]) === Number(ctx.from.id)) {
+      const first = ctx.from.first_name || "friend";
+      await ctx.reply(
+        `Welcome, ${esc(
+          first
+        )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
+      );
+      return;
     }
   }
 
@@ -396,7 +387,7 @@ bot.start(async (ctx) => {
     ? `Welcome back to LuckyCoin Tipbot.\nType /help for commands.`
     : `Welcome to LuckyCoin Tipbot.\nType /help for commands.`;
 
-  if (isGroup(ctx)) {
+  if (ctx.chat?.type === "group" || ctx.chat?.type === "supergroup") {
     await dm(ctx, msg);
   } else {
     await ctx.reply(msg);
