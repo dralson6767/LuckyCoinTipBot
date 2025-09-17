@@ -247,11 +247,10 @@ async function getBalanceLitesFast(userId: number): Promise<bigint> {
   const sql = `
     SELECT
       u.transferred_tip_lites
-      + COALESCE((SELECT SUM(l.delta_lites)
-                  FROM public.ledger l
-                  WHERE l.user_id = u.id
-                    AND l.reason IN ('deposit','withdrawal')), 0) AS balance_lites
+      + COALESCE(r.dw_sum_lites, 0) AS balance_lites
     FROM public.users u
+    LEFT JOIN public.ledger_dw_rollup r
+      ON r.user_id = u.id
     WHERE u.id = $1
     LIMIT 1;
   `;
