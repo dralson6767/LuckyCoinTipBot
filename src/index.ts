@@ -336,23 +336,39 @@ bot.command("health", async (ctx) => {
 
 // ---------- commands ----------
 bot.start(async (ctx) => {
+  // ensure user exists (hot-path cached)
   const u = await ensureUserCached(ctx.from);
+  const newUname = ctx.from.username || null;
 
-  // Read previous state first (so we can say "Welcome back")
-  const prev = await query<{ has_started: boolean }>(
-    "SELECT has_started FROM public.users WHERE id = $1",
-    [u.id]
-  );
-  const wasStarted = prev.rows[0]?.has_started === true;
-
-  // Mark as started (and update username)
-  await query(
-    `UPDATE public.users
-       SET has_started = TRUE,
-           username    = COALESCE($2, username)
-     WHERE id = $1`,
-    [u.id, ctx.from.username || null]
-  );
+  // one round-trip: read previous + update only if needed
+  const sql = `
+    WITH prev AS (
+      SELECT id, has_started, username
+      FROM public.users
+      WHERE id = $1
+    ),
+    upd AS (
+      UPDATE public.users AS uu
+      SET has_started = TRUE,
+          username    = COALESCE($2, uu.username)
+      FROM prev
+      WHERE uu.id = prev.id
+        AND (
+          prev.has_started IS DISTINCT FROM TRUE OR
+          COALESCE($2, prev.username) IS DISTINCT FROM prev.username
+        )
+      RETURNING 1
+    )
+    SELECT prev.has_started AS was_started,
+           EXISTS(SELECT 1 FROM upd) AS changed
+    FROM prev
+    LIMIT 1;
+  `;
+  const r = await query<{ was_started: boolean; changed: boolean }>(sql, [
+    u.id,
+    newUname,
+  ]);
+  const wasStarted = r.rows[0]?.was_started === true;
 
   // Deep-link payload when user came from ?start=...
   const payload =
