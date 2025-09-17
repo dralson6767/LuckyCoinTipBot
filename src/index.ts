@@ -5,20 +5,32 @@ import { rpc } from "./rpc.js";
 import { query } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
+import { createRequire } from "module";
+import * as https from "node:https";
 
-(async () => {
+(() => {
+  // Try undici if present; otherwise fall back to core https keep-alive.
   try {
-    const undici = await (Function(
-      'return import("undici")'
-    )() as Promise<any>);
-    const { setGlobalDispatcher, Agent } = undici;
-    setGlobalDispatcher(
-      new Agent({ keepAliveTimeout: 30_000, keepAliveMaxTimeout: 60_000 })
-    );
-    console.log("[net] undici keep-alive enabled");
+    const req = createRequire(import.meta.url);
+    const undici: any = req("undici"); // no type dependency
+    if (undici?.setGlobalDispatcher && undici?.Agent) {
+      undici.setGlobalDispatcher(
+        new undici.Agent({
+          keepAliveTimeout: 30_000,
+          keepAliveMaxTimeout: 60_000,
+        })
+      );
+      console.log("[net] undici keep-alive enabled");
+      return;
+    }
   } catch {
-    console.log("[net] undici not found; skipping keep-alive setup");
+    // undici not installed / incompatible -> use https fallback
   }
+
+  // Fallback: replace the global HTTPS agent with a keep-alive agent
+  const ka = new https.Agent({ keepAlive: true, maxSockets: 64 });
+  (https as any).globalAgent = ka; // assign new agent
+  console.log("[net] https keep-alive enabled (fallback)");
 })();
 
 // ---------- bot init ----------
