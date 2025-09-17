@@ -6,6 +6,21 @@ import { query } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
+(async () => {
+  try {
+    const undici = await (Function(
+      'return import("undici")'
+    )() as Promise<any>);
+    const { setGlobalDispatcher, Agent } = undici;
+    setGlobalDispatcher(
+      new Agent({ keepAliveTimeout: 30_000, keepAliveMaxTimeout: 60_000 })
+    );
+    console.log("[net] undici keep-alive enabled");
+  } catch {
+    console.log("[net] undici not found; skipping keep-alive setup");
+  }
+})();
+
 // ---------- bot init ----------
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
@@ -21,6 +36,7 @@ const ENSURE_USER_CACHE_MS = Number(
   process.env.ENSURE_USER_CACHE_MS ?? "300000"
 ); // 5 min
 const MAX_RPC_INFLIGHT = Number(process.env.MAX_RPC_INFLIGHT ?? "4");
+const MAX_TG_INFLIGHT = Number(process.env.MAX_TG_INFLIGHT ?? "8");
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 
 // tiny cache for @username → tg id
@@ -73,9 +89,26 @@ const ephemeralReply = async (
   } catch {}
 };
 
+// ---- Telegram send gate (prevents handlers from blocking under bursts) ----
+let tgInflight = 0;
+const tgWaiters: Array<() => void> = [];
+async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
+  if (tgInflight >= MAX_TG_INFLIGHT) {
+    await new Promise<void>((res) => tgWaiters.push(res));
+  }
+  tgInflight++;
+  try {
+    return await fn();
+  } finally {
+    tgInflight--;
+    const n = tgWaiters.shift();
+    if (n) n();
+  }
+}
+
 const dm = async (ctx: any, text: string, extra: any = {}) => {
   try {
-    await ctx.telegram.sendMessage(ctx.from.id, text, extra);
+    await withTgGate(() => ctx.telegram.sendMessage(ctx.from.id, text, extra));
     return true;
   } catch (e: any) {
     console.error("[dm] failed:", e?.message || e);
@@ -92,22 +125,22 @@ async function dmLater(
 ) {
   (async () => {
     try {
-      await ctx.telegram.sendMessage(chatId, text, extra);
+      await withTgGate(() => ctx.telegram.sendMessage(chatId, text, extra));
       console.log("[dmLater] delivered", chatId);
     } catch (e: any) {
-      const retry = e?.parameters?.retry_after;
+      const retry = (e as any)?.parameters?.retry_after;
       if (retry) {
         console.warn("[dmLater] flood-wait", retry, "s; chat", chatId);
         setTimeout(() => {
-          ctx.telegram
-            .sendMessage(chatId, text, extra)
-            .catch((err: unknown) => {
+          withTgGate(() => ctx.telegram.sendMessage(chatId, text, extra)).catch(
+            (err: unknown) => {
               const msg = (err as any)?.message ?? err;
               console.error("[dmLater] retry failed", chatId, msg);
-            });
+            }
+          );
         }, (retry + 1) * 1000);
       } else {
-        console.error("[dmLater] failed", chatId, e?.message || e);
+        console.error("[dmLater] failed", chatId, (e as any)?.message || e);
       }
     }
   })();
@@ -242,7 +275,7 @@ async function ensureSetup() {
   await query(`ANALYZE public.ledger;`).catch(() => {});
 }
 
-// ---------- FAST BALANCE ----------
+// ---------- FAST BALANCE (rollup table) ----------
 async function getBalanceLitesFast(userId: number): Promise<bigint> {
   const sql = `
     SELECT
@@ -382,7 +415,7 @@ bot.start(async (ctx) => {
           first
         )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
       );
-      if (isGroup(ctx)) deleteAfter(ctx); // <- delete /start command in groups
+      if (isGroup(ctx)) deleteAfter(ctx); // delete /start in groups
       return;
     }
   }
@@ -392,8 +425,8 @@ bot.start(async (ctx) => {
     : `Welcome to LuckyCoin Tipbot.\nType /help for commands.`;
 
   if (isGroup(ctx)) {
-    await dm(ctx, msg); // reply in DM for privacy
-    deleteAfter(ctx); // <- always delete the /start in group
+    dmLater(ctx, ctx.from.id, msg); // fire-and-forget DM
+    deleteAfter(ctx); // always delete the /start in group
   } else {
     await ctx.reply(msg); // normal DM chat
   }
@@ -549,7 +582,7 @@ bot.command("balance", async (ctx) => {
     } else {
       await ctx.reply(text);
     }
-    console.log("[/balance] ok]");
+    console.log("[/balance] ok");
   } catch (e: any) {
     console.error("[/balance] ERR", e?.message || e);
     await ephemeralReply(
@@ -582,7 +615,9 @@ bot.command("tip", async (ctx) => {
       ctx,
       "Usage: reply `/tip 1.23` OR `/tip @username 1.23`",
       6000,
-      { parse_mode: "Markdown" }
+      {
+        parse_mode: "Markdown",
+      }
     );
     return;
   }
@@ -864,7 +899,7 @@ bot.command("withdraw", async (ctx) => {
 // ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
-bot.launch().then(async () => {
+bot.launch({ dropPendingUpdates: true }).then(async () => {
   await ensureSetup(); // indexes + has_started
   await getBotUsernameEnsured();
   console.log("Tipbot is running.");
