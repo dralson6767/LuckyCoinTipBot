@@ -2,25 +2,21 @@ services:
   postgres:
     image: postgres:16
     container_name: tipbot-postgres
-    restart: always
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: tipbot
       TZ: UTC
-    # bind only to localhost on the host (containers still use 'postgres:5432')
     ports:
-      - "127.0.0.1:5432:5432"
+      - "5432:5432"
     volumes:
       - tipbot_data:/var/lib/postgresql/data
-    shm_size: "256m"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 3s
       retries: 5
-    ulimits:
-      nofile: 65536
     logging:
       driver: json-file
       options:
@@ -30,32 +26,19 @@ services:
   bot:
     build: .
     container_name: tipbot-bot
-    restart: always
+    restart: unless-stopped
     env_file: .env
     environment:
-      # keep EXACT for your working node RPC path
+      # Use docker bridge IP for fast, predictable RPC on Linux
       LKY_RPC_URL: http://172.18.0.1:9918
       NODE_RPC_URL: http://172.18.0.1:9918
       RPC_URL: http://172.18.0.1:9918
       TZ: UTC
-      NODE_OPTIONS: "--max-old-space-size=256 --unhandled-rejections=strict"
     depends_on:
       postgres:
         condition: service_healthy
     init: true
     command: ["npm", "run", "start:bot"]
-    # simple liveness; if node hangs, autoheal will restart
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -x node >/dev/null"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-    mem_limit: 512m
-    cpus: "0.75"
-    ulimits:
-      nofile: 65536
-    labels:
-      - autoheal=true
     logging:
       driver: json-file
       options:
@@ -65,49 +48,27 @@ services:
   worker:
     build: .
     container_name: tipbot-worker
-    restart: always
+    restart: unless-stopped
     env_file: .env
     environment:
+      # Use docker bridge IP for fast, predictable RPC on Linux
       LKY_RPC_URL: http://172.18.0.1:9918
       NODE_RPC_URL: http://172.18.0.1:9918
       RPC_URL: http://172.18.0.1:9918
       TZ: UTC
-      NODE_OPTIONS: "--max-old-space-size=256 --unhandled-rejections=strict"
     depends_on:
       postgres:
         condition: service_healthy
     init: true
     command: ["npm", "run", "start:worker"]
-    healthcheck:
-      test: ["CMD-SHELL", "pgrep -x node >/dev/null"]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-    mem_limit: 512m
-    cpus: "0.75"
-    ulimits:
-      nofile: 65536
-    labels:
-      - autoheal=true
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
 
-  autoheal:
-    image: willfarrell/autoheal
-    container_name: tipbot-autoheal
-    restart: always
-    # defaults to looking for containers with label 'autoheal=true'
-    environment:
-      AUTOHEAL_INTERVAL: 30
-      AUTOHEAL_START_PERIOD: 60
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-
 volumes:
   tipbot_data:
     external: true
-    # keep this EXACT name
+    # Keep this EXACT name (confirmed on your host)
     name: tipbot_pg_sql_2025_08_31_031701
