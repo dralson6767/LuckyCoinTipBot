@@ -17,11 +17,37 @@ const RESOLVE_USERNAME_TIMEOUT_MS = Number(
 );
 const USERNAME_CACHE_MS = Number(process.env.USERNAME_CACHE_MS ?? "1200000"); // 20 min
 const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
+const ENSURE_USER_CACHE_MS = Number(
+  process.env.ENSURE_USER_CACHE_MS ?? "300000"
+); // 5 min
+const MAX_RPC_INFLIGHT = Number(process.env.MAX_RPC_INFLIGHT ?? "4");
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 
 // tiny cache for @username → tg id
 type CacheHit = { id: number; ts: number };
 const unameCache = new Map<string, CacheHit>();
+
+// --- ensureUser (hot-path) cache ---
+const ensureUserCache = new Map<
+  number,
+  { id: number; uname?: string; ts: number }
+>();
+async function ensureUserCached(tg: any) {
+  const id = Number(tg?.id);
+  const uname = tg?.username || undefined;
+  const now = Date.now();
+  const hit = ensureUserCache.get(id);
+  if (
+    hit &&
+    now - hit.ts < ENSURE_USER_CACHE_MS &&
+    (!uname || uname === hit.uname)
+  ) {
+    return { id: hit.id };
+  }
+  const u = await ensureUser(tg);
+  ensureUserCache.set(id, { id: u.id, uname, ts: now });
+  return u;
+}
 
 // ---------- helpers ----------
 const isGroup = (ctx: any) =>
@@ -170,6 +196,23 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// ---- RPC concurrency gate (prevents thundering herd on the node) ----
+let rpcInflight = 0;
+const rpcWaiters: Array<() => void> = [];
+async function withRpcGate<T>(fn: () => Promise<T>): Promise<T> {
+  if (rpcInflight >= MAX_RPC_INFLIGHT) {
+    await new Promise<void>((res) => rpcWaiters.push(res));
+  }
+  rpcInflight++;
+  try {
+    return await fn();
+  } finally {
+    rpcInflight--;
+    const next = rpcWaiters.shift();
+    if (next) next();
+  }
+}
+
 // ---------- one-time setup: schema + indexes for speed ----------
 async function ensureSetup() {
   await query(
@@ -217,7 +260,7 @@ async function getBalanceLitesFast(userId: number): Promise<bigint> {
   return BigInt(v);
 }
 
-// ===== Small balance cache (instant /balance + explicit invalidation) =====
+// ===== Small balance cache (instant /balance + write-through updates) =====
 const balanceCache = new Map<number, { bal: bigint; ts: number }>();
 
 async function getBalanceCached(userId: number): Promise<bigint> {
@@ -229,6 +272,10 @@ async function getBalanceCached(userId: number): Promise<bigint> {
 }
 function invalidateBalance(...userIds: number[]) {
   for (const id of userIds) balanceCache.delete(id);
+}
+function adjustBalanceCache(userId: number, delta: bigint) {
+  const h = balanceCache.get(userId);
+  if (h) balanceCache.set(userId, { bal: h.bal + delta, ts: Date.now() });
 }
 
 // ---------- deposit address (reuse) ----------
@@ -246,17 +293,17 @@ async function getOrAssignDepositAddress(
   const label = String(tgUserId);
   let addr: string | undefined;
 
-  const r1 = await rpcTry<Record<string, any>>(
-    "getaddressesbylabel",
-    [label],
-    3000
+  const r1 = await withRpcGate(() =>
+    rpcTry<Record<string, any>>("getaddressesbylabel", [label], 3000)
   );
   if (r1.ok && r1.value && typeof r1.value === "object") {
     const keys = Object.keys(r1.value);
     if (keys.length > 0) addr = keys[0];
   }
   if (!addr) {
-    const r2 = await rpcTry<string>("getnewaddress", [label], 3000);
+    const r2 = await withRpcGate(() =>
+      rpcTry<string>("getnewaddress", [label], 3000)
+    );
     if (r2.ok && r2.value) addr = r2.value;
   }
   if (!addr) throw new Error("DEPOSIT_ADDR_FAILED");
@@ -290,7 +337,7 @@ bot.command("health", async (ctx) => {
 
 // ---------- commands ----------
 bot.start(async (ctx) => {
-  const u = await ensureUser(ctx.from);
+  const u = await ensureUserCached(ctx.from);
 
   // Read previous state first (so we can say "Welcome back")
   const prev = await query<{ has_started: boolean }>(
@@ -392,7 +439,7 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
     )) as TgChatMinimal;
 
     if (chat?.id != null) {
-      await ensureUser({ id: chat.id, username: uname } as any); // persist minimal
+      await ensureUserCached({ id: chat.id, username: uname } as any); // persist minimal
       const id = Number(chat.id);
       unameCache.set(key, { id, ts: Date.now() });
       return id;
@@ -410,7 +457,7 @@ const CACHE_MS = 10 * 60 * 1000; // 10 minutes
 
 bot.command("deposit", async (ctx) => {
   console.log("[/deposit] start", ctx.from?.id, ctx.chat?.id);
-  const user = await ensureUser(ctx.from);
+  const user = await ensureUserCached(ctx.from);
 
   const replyAddr = async (addr: string) => {
     const msg = `Your LKY deposit address:\n\`${addr}\``;
@@ -474,7 +521,7 @@ bot.command("deposit", async (ctx) => {
 bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
-    const user = await ensureUser(ctx.from);
+    const user = await ensureUserCached(ctx.from);
     const bal = await getBalanceCached(user.id); // <- cached
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
@@ -491,7 +538,7 @@ bot.command("balance", async (ctx) => {
     } else {
       await ctx.reply(text);
     }
-    console.log("[/balance] ok");
+    console.log("[/balance] ok]");
   } catch (e: any) {
     console.error("[/balance] ERR", e?.message || e);
     await ephemeralReply(
@@ -506,7 +553,7 @@ bot.command("balance", async (ctx) => {
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
-  const from = await ensureUser(ctx.from);
+  const from = await ensureUserCached(ctx.from);
 
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
@@ -547,19 +594,20 @@ bot.command("tip", async (ctx) => {
 
   if (replyTo?.id) {
     targetUserId = Number(replyTo.id);
-    await ensureUser(replyTo);
+    await ensureUserCached(replyTo);
   } else if (parts.length >= 2 && parts[0].startsWith("@")) {
     unameFromCmd = parts[0];
     targetUserId = await resolveUserIdByUsername(ctx, unameFromCmd);
     if (!targetUserId) {
       const mention = await botMention(ctx);
       const link = await botDeepLink(ctx, `claim-${Date.now()}`);
+      const unameClean = (unameFromCmd || "").replace(/^@/, "");
       const msg = link
         ? `User @${esc(
-            unameFromCmd.replace(/^@/, "")
+            unameClean
           )} hasn’t started the bot. Ask them to tap: ${link}`
         : `User @${esc(
-            unameFromCmd.replace(/^@/, "")
+            unameClean
           )} hasn’t started the bot yet. Find me at ${mention}.`;
       if (isGroup(ctx)) {
         const ok = await dm(ctx, msg);
@@ -569,13 +617,6 @@ bot.command("tip", async (ctx) => {
       }
       return;
     }
-  } else {
-    await ephemeralReply(
-      ctx,
-      "Who are you tipping? Reply to someone or use @username.",
-      6000
-    );
-    return;
   }
 
   if (targetUserId === ctx.from.id) {
@@ -585,8 +626,8 @@ bot.command("tip", async (ctx) => {
 
   // ensure recipient exists (if not from replyTo branch)
   const to = replyTo
-    ? await ensureUser(replyTo)
-    : await ensureUser({
+    ? await ensureUserCached(replyTo)
+    : await ensureUserCached({
         id: targetUserId!,
         username: unameFromCmd?.replace(/^@/, "") || undefined,
       });
@@ -609,7 +650,9 @@ bot.command("tip", async (ctx) => {
       return;
     }
 
-    invalidateBalance(from.id, to.id);
+    // write-through: keep cached balances hot
+    adjustBalanceCache(from.id, -amount);
+    adjustBalanceCache(to.id, amount);
 
     if (startedRes.status === "fulfilled") {
       needsStart =
@@ -674,7 +717,7 @@ bot.command("tip", async (ctx) => {
 // ----- /withdraw -----
 bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] start");
-  const sender = await ensureUser(ctx.from);
+  const sender = await ensureUserCached(ctx.from);
 
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
@@ -751,10 +794,8 @@ bot.command("withdraw", async (ctx) => {
   }
 
   const amtStr = formatLky(amount, 8);
-  const send = await rpcTry<string>(
-    "sendtoaddress",
-    [toAddress, Number(amtStr)],
-    15000
+  const send = await withRpcGate(() =>
+    rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
   );
 
   if (!send.ok) {
@@ -793,7 +834,8 @@ bot.command("withdraw", async (ctx) => {
 
   try {
     await debit(sender.id, amount, "withdrawal", txid);
-    invalidateBalance(sender.id); // <- bust cache after withdraw
+    // write-through cache (sender spent funds)
+    adjustBalanceCache(sender.id, -amount);
   } catch (e: any) {
     console.error("[/withdraw] debit ledger ERR:", e?.message || e);
   }
