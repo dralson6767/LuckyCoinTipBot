@@ -501,6 +501,7 @@ bot.help(async (ctx) => {
         link ? `Please DM me first: ${mention}` : "Please DM me first.",
         6000
       );
+    deleteAfter(ctx); // <- delete the user's /help command in groups
   } else {
     await safeReply(ctx, text, { parse_mode: "Markdown" });
   }
@@ -550,6 +551,7 @@ bot.command("deposit", async (ctx) => {
     if (isGroup(ctx)) {
       await ephemeralReply(ctx, msg, 12000, { parse_mode: "Markdown" });
       dmLater(ctx, ctx.from.id, msg, { parse_mode: "Markdown" });
+      deleteAfter(ctx); // <- delete the user's /deposit command in groups
     } else {
       await safeReply(ctx, msg, { parse_mode: "Markdown" });
     }
@@ -597,6 +599,7 @@ bot.command("deposit", async (ctx) => {
           link ? `Please DM me first: ${mention}` : "Please DM me first.",
           6000
         );
+      deleteAfter(ctx); // <- delete the user's /deposit command even on errors
     } else {
       await safeReply(ctx, msg);
     }
@@ -621,10 +624,11 @@ bot.command("balance", async (ctx) => {
           6000
         );
       }
+      deleteAfter(ctx); // <- delete the user's /balance command in groups
     } else {
       await safeReply(ctx, text);
     }
-    console.log("[/balance] ok]");
+    console.log("[/balance] ok");
   } catch (e: any) {
     console.error("[/balance] ERR", e?.message || e);
     await ephemeralReply(
@@ -632,6 +636,7 @@ bot.command("balance", async (ctx) => {
       "Balance temporarily unavailable, try again shortly.",
       6000
     );
+    if (isGroup(ctx)) deleteAfter(ctx); // <- also delete on errors
   }
 });
 
@@ -789,7 +794,7 @@ bot.command("tip", async (ctx) => {
   const extra: any = { parse_mode: "HTML" };
   if (kb) extra.reply_markup = kb.reply_markup;
   await safeReply(ctx, lines.join("\n"), extra);
-  deleteAfter(ctx);
+  deleteAfter(ctx); // delete user's /tip command, keep our public reply
 
   const dmText = [
     `🎉 You’ve been tipped ${esc(pretty)} LKY by ${esc(fromName)}.`,
@@ -806,7 +811,7 @@ bot.command("tip", async (ctx) => {
 
 // ----- /withdraw -----  (instant ack + background RPC)
 bot.command("withdraw", async (ctx) => {
-  console.log("[/withdraw] start]");
+  console.log("[/withdraw] start");
   const sender = await ensureUserCached(ctx.from);
 
   const text = ctx.message?.text || "";
@@ -825,6 +830,7 @@ bot.command("withdraw", async (ctx) => {
           link ? `Please DM me first: ${mention}` : "Please DM me first.",
           6000
         );
+      deleteAfter(ctx); // <- delete command
     } else {
       await safeReply(ctx, msg);
     }
@@ -840,6 +846,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       const ok = await dm(ctx, msg);
       if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
+      deleteAfter(ctx);
     } else {
       await safeReply(ctx, msg);
     }
@@ -850,6 +857,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       const ok = await dm(ctx, msg);
       if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
+      deleteAfter(ctx);
     } else {
       await safeReply(ctx, msg);
     }
@@ -865,6 +873,7 @@ bot.command("withdraw", async (ctx) => {
     if (isGroup(ctx)) {
       const ok = await dm(ctx, msg);
       if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
+      deleteAfter(ctx);
     } else {
       await safeReply(ctx, msg);
     }
@@ -876,7 +885,7 @@ bot.command("withdraw", async (ctx) => {
   const ack = `Processing your withdrawal...\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nI'll DM you the result.`;
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, ack, 6000, { parse_mode: "Markdown" });
-    deleteAfter(ctx);
+    deleteAfter(ctx); // <- delete command once acknowledged
   } else {
     await safeReply(ctx, ack, { parse_mode: "Markdown" });
   }
