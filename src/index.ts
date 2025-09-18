@@ -5,14 +5,11 @@ import { rpc } from "./rpc.js";
 import { query } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
-import * as https from "node:https";
 
-// ---------- bot init (safe HTTPS keep-alive, no globals) ----------
+// ---------- bot init ----------
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
-
-const httpsKA = new https.Agent({ keepAlive: true, maxSockets: 64 });
-const bot = new Telegraf(botToken, { telegram: { agent: httpsKA } } as any);
+const bot = new Telegraf(botToken);
 
 // ---------- perf knobs ----------
 const RESOLVE_USERNAME_TIMEOUT_MS = Number(
@@ -77,66 +74,30 @@ const ephemeralReply = async (
   } catch {}
 };
 
-// ---- Telegram send gate (prevents bursts from stalling handlers) ----
-// We provide a *try-acquire* path for synchronous DM attempts so handlers
-// never block. If the gate is saturated, we schedule dmLater and return fast.
+// ---- Telegram send gate (prevents handlers from blocking under bursts) ----
 let tgInflight = 0;
 const tgWaiters: Array<() => void> = [];
-function tryAcquireTg(): boolean {
-  if (tgInflight >= MAX_TG_INFLIGHT) return false;
-  tgInflight++;
-  return true;
-}
-function releaseTg() {
-  tgInflight = Math.max(0, tgInflight - 1);
-  const n = tgWaiters.shift();
-  if (n) n();
-}
 async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
-  if (!tryAcquireTg()) {
+  if (tgInflight >= MAX_TG_INFLIGHT) {
     await new Promise<void>((res) => tgWaiters.push(res));
   }
+  tgInflight++;
   try {
     return await fn();
   } finally {
-    releaseTg();
+    tgInflight--;
+    const n = tgWaiters.shift();
+    if (n) n();
   }
 }
-// Non-blocking DM helper:
-// - If the gate has room, send immediately.
-// - If the gate is saturated or we hit flood-wait, schedule background send.
-// - Returns true if sent immediately, false if scheduled or failed.
-const dm = async (
-  ctx: any,
-  text: string,
-  extra: any = {}
-): Promise<boolean> => {
-  // Fast-path attempt without waiting if queue is full
-  if (!tryAcquireTg()) {
-    dmLater(ctx, ctx.from.id, text, extra);
-    return false;
-  }
+
+const dm = async (ctx: any, text: string, extra: any = {}) => {
   try {
-    await ctx.telegram.sendMessage(ctx.from.id, text, extra);
+    await withTgGate(() => ctx.telegram.sendMessage(ctx.from.id, text, extra));
     return true;
   } catch (e: any) {
-    const retry = e?.parameters?.retry_after;
-    if (retry) {
-      // schedule retry non-blocking
-      setTimeout(() => {
-        ctx.telegram
-          .sendMessage(ctx.from.id, text, extra)
-          .catch((err: any) =>
-            console.error("[dmLater/auto-retry] failed:", err?.message || err)
-          );
-      }, (retry + 1) * 1000);
-    } else {
-      // schedule a best-effort background attempt
-      dmLater(ctx, ctx.from.id, text, extra);
-    }
+    console.error("[dm] failed:", e?.message || e);
     return false;
-  } finally {
-    releaseTg();
   }
 };
 
@@ -449,6 +410,14 @@ bot.start(async (ctx) => {
     : `Welcome to LuckyCoin Tipbot.\nType /help for commands.`;
 
   if (isGroup(ctx)) {
+    // immediate ack so it never feels frozen
+    await ephemeralReply(
+      ctx,
+      `Sent you a DM with details. If you don't see it, tap ${await botMention(
+        ctx
+      )}.`,
+      5000
+    );
     dmLater(ctx, ctx.from.id, msg); // fire-and-forget DM
     deleteAfter(ctx); // always delete the /start in group
   } else {
@@ -468,15 +437,13 @@ bot.help(async (ctx) => {
     isGroup(ctx) && link ? `\n*Tip:* Use me in DM for privacy: ${mention}` : "",
   ].join("\n");
   if (isGroup(ctx)) {
-    // Non-blocking: schedule DM, also show a brief ephemeral hint
-    dmLater(ctx, ctx.from.id, text, { parse_mode: "Markdown" });
-    await ephemeralReply(
-      ctx,
-      link
-        ? `Sent you /help in DM. If not, tap ${mention}.`
-        : "Sent you /help in DM.",
-      6000
-    );
+    const ok = await dm(ctx, text, { parse_mode: "Markdown" });
+    if (!ok)
+      await ephemeralReply(
+        ctx,
+        link ? `Please DM me first: ${mention}` : "Please DM me first.",
+        6000
+      );
   } else {
     await ctx.reply(text, { parse_mode: "Markdown" });
   }
@@ -574,12 +541,13 @@ bot.command("deposit", async (ctx) => {
       ? "Wallet is busy. Try /deposit again in a minute."
       : "Wallet temporarily unavailable. Try /deposit again shortly.";
     if (isGroup(ctx)) {
-      await ephemeralReply(
-        ctx,
-        link ? `Please DM me first: ${mention}` : "Please DM me first.",
-        6000
-      );
-      dmLater(ctx, ctx.from.id, msg);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(
+          ctx,
+          link ? `Please DM me first: ${mention}` : "Please DM me first.",
+          6000
+        );
     } else {
       await ctx.reply(msg);
     }
@@ -594,9 +562,16 @@ bot.command("balance", async (ctx) => {
     const bal = await getBalanceCached(user.id); // <- cached
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
-      // Non-blocking: schedule DM and show a brief hint
-      dmLater(ctx, ctx.from.id, text);
-      await ephemeralReply(ctx, "Sent your balance in DM.", 5000);
+      const ok = await dm(ctx, text);
+      if (!ok) {
+        const mention = await botMention(ctx);
+        const link = await botDeepLink(ctx);
+        await ephemeralReply(
+          ctx,
+          link ? `Please DM me first: ${mention}` : "Please DM me first.",
+          6000
+        );
+      }
     } else {
       await ctx.reply(text);
     }
@@ -672,13 +647,20 @@ bot.command("tip", async (ctx) => {
             unameClean
           )} hasn’t started the bot yet. Find me at ${mention}.`;
       if (isGroup(ctx)) {
-        await ephemeralReply(ctx, msg, 8000);
-        dmLater(ctx, ctx.from.id, msg);
+        const ok = await dm(ctx, msg);
+        if (!ok) await ephemeralReply(ctx, msg, 8000);
       } else {
         await ctx.reply(msg);
       }
       return;
     }
+  } else {
+    await ephemeralReply(
+      ctx,
+      "Who are you tipping? Reply to someone or use @username.",
+      6000
+    );
+    return;
   }
 
   if (targetUserId === ctx.from.id) {
@@ -790,12 +772,13 @@ bot.command("withdraw", async (ctx) => {
     const link = await botDeepLink(ctx);
     const msg = "Usage: /withdraw <address> <amount>";
     if (isGroup(ctx)) {
-      await ephemeralReply(
-        ctx,
-        link ? `Please DM me first: ${mention}` : "Please DM me first.",
-        6000
-      );
-      dmLater(ctx, ctx.from.id, msg);
+      const ok = await dm(ctx, msg);
+      if (!ok)
+        await ephemeralReply(
+          ctx,
+          link ? `Please DM me first: ${mention}` : "Please DM me first.",
+          6000
+        );
     } else {
       await ctx.reply(msg);
     }
@@ -809,8 +792,8 @@ bot.command("withdraw", async (ctx) => {
   } catch (e: any) {
     const msg = `Invalid amount: ${e.message}`;
     if (isGroup(ctx)) {
-      await ephemeralReply(ctx, "Please DM me first.", 6000);
-      dmLater(ctx, ctx.from.id, msg);
+      const ok = await dm(ctx, msg);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -819,8 +802,8 @@ bot.command("withdraw", async (ctx) => {
   if (!isValidTipAmount(amount)) {
     const msg = "Amount too small.";
     if (isGroup(ctx)) {
-      await ephemeralReply(ctx, "Please DM me first.", 6000);
-      dmLater(ctx, ctx.from.id, msg);
+      const ok = await dm(ctx, msg);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -834,8 +817,8 @@ bot.command("withdraw", async (ctx) => {
       decimals
     )} LKY.`;
     if (isGroup(ctx)) {
-      await ephemeralReply(ctx, "Please DM me first.", 6000);
-      dmLater(ctx, ctx.from.id, msg);
+      const ok = await dm(ctx, msg);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -846,8 +829,8 @@ bot.command("withdraw", async (ctx) => {
   if (v.ok && v.value && v.value.isvalid === false) {
     const msg = "Invalid address.";
     if (isGroup(ctx)) {
-      await ephemeralReply(ctx, "Please DM me first.", 6000);
-      dmLater(ctx, ctx.from.id, msg);
+      const ok = await dm(ctx, msg);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -872,8 +855,8 @@ bot.command("withdraw", async (ctx) => {
       : `Withdraw failed: ${errStr}`;
 
     if (isGroup(ctx)) {
-      await ephemeralReply(ctx, "Please DM me first.", 6000);
-      dmLater(ctx, ctx.from.id, msg);
+      const ok = await dm(ctx, msg);
+      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
       await ctx.reply(msg);
     }
@@ -903,8 +886,7 @@ bot.command("withdraw", async (ctx) => {
 
   const okMsg = `Withdrawal sent.\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nTXID: \`${txid}\``;
   if (isGroup(ctx)) {
-    dmLater(ctx, ctx.from.id, okMsg, { parse_mode: "Markdown" });
-    await ephemeralReply(ctx, "Withdrawal info sent in DM.", 5000);
+    await dm(ctx, okMsg, { parse_mode: "Markdown" });
   } else {
     await ctx.reply(okMsg, { parse_mode: "Markdown" });
   }
