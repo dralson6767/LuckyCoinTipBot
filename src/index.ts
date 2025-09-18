@@ -214,6 +214,19 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// small helper to time steps in logs
+async function timed<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  const t0 = Date.now();
+  try {
+    const res = await fn();
+    console.log(`[timing] ${label} ${Date.now() - t0}ms`);
+    return res;
+  } catch (e) {
+    console.log(`[timing] ${label} ${Date.now() - t0}ms (ERR)`);
+    throw e;
+  }
+}
+
 // ---- RPC concurrency gate (prevents thundering herd on the node) ----
 let rpcInflight = 0;
 const rpcWaiters: Array<() => void> = [];
@@ -575,7 +588,7 @@ bot.command("balance", async (ctx) => {
     } else {
       await ctx.reply(text);
     }
-    console.log("[/balance] ok");
+    console.log("[/balance] ok]");
   } catch (e: any) {
     console.error("[/balance] ERR", e?.message || e);
     await ephemeralReply(
@@ -758,7 +771,7 @@ bot.command("tip", async (ctx) => {
   console.log("[/tip] ok (non-blocking DM)");
 });
 
-// ----- /withdraw -----
+// ----- /withdraw -----  (instant ack + background RPC)
 bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] start");
   const sender = await ensureUserCached(ctx.from);
@@ -810,7 +823,8 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  const bal = await getBalanceCached(sender.id); // cached read is fine
+  // quick balance check (cached)
+  const bal = await getBalanceCached(sender.id);
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
       bal,
@@ -825,73 +839,89 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
-  const v = await rpcTry<any>("validateaddress", [toAddress], 5000);
-  if (v.ok && v.value && v.value.isvalid === false) {
-    const msg = "Invalid address.";
-    if (isGroup(ctx)) {
-      const ok = await dm(ctx, msg);
-      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
-    } else {
-      await ctx.reply(msg);
-    }
-    return;
-  }
-
   const amtStr = formatLky(amount, 8);
-  const send = await withRpcGate(() =>
-    rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
-  );
 
-  if (!send.ok) {
-    const errStr = String(send.err?.message || send.err || "unknown error");
-    console.error("[/withdraw] RPC ERR:", errStr);
-
-    const msg = isWalletBusy(send.err)
-      ? "Wallet is busy. Try /withdraw again in a minute."
-      : /invalid|address/i.test(errStr)
-      ? "Invalid address."
-      : /insufficient|fund/i.test(errStr)
-      ? "Node wallet has insufficient funds."
-      : `Withdraw failed: ${errStr}`;
-
-    if (isGroup(ctx)) {
-      const ok = await dm(ctx, msg);
-      if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
-    } else {
-      await ctx.reply(msg);
-    }
-    return;
-  }
-
-  const txid = send.value;
-
-  try {
-    await query(
-      `INSERT INTO public.withdrawals (user_id, to_address, amount_lites, txid, status, created_at)
-       VALUES ($1,$2,$3,$4,'sent', NOW())
-       ON CONFLICT (txid) DO NOTHING`,
-      [sender.id, toAddress, amount.toString(), txid]
-    );
-  } catch (e: any) {
-    console.error("[/withdraw] insert withdrawals ERR:", e?.message || e);
-  }
-
-  try {
-    await debit(sender.id, amount, "withdrawal", txid);
-    // write-through cache (sender spent funds)
-    adjustBalanceCache(sender.id, -amount);
-  } catch (e: any) {
-    console.error("[/withdraw] debit ledger ERR:", e?.message || e);
-  }
-
-  const okMsg = `Withdrawal sent.\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nTXID: \`${txid}\``;
+  // immediate ack so chat doesn't block
+  const ack = `Processing your withdrawal...\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nI'll DM you the result.`;
   if (isGroup(ctx)) {
-    await dm(ctx, okMsg, { parse_mode: "Markdown" });
+    await ephemeralReply(ctx, ack, 6000, { parse_mode: "Markdown" });
+    deleteAfter(ctx);
   } else {
-    await ctx.reply(okMsg, { parse_mode: "Markdown" });
+    await ctx.reply(ack, { parse_mode: "Markdown" });
   }
 
-  console.log("[/withdraw] ok", txid);
+  // background work
+  (async () => {
+    try {
+      const v = await timed("validateaddress", () =>
+        rpcTry<any>("validateaddress", [toAddress], 5000)
+      );
+      if (v.ok && v.value && v.value.isvalid === false) {
+        return dmLater(ctx, ctx.from.id, "Invalid address.");
+      }
+
+      const send = await timed("sendtoaddress", () =>
+        withRpcGate(() =>
+          rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
+        )
+      );
+
+      if (!send.ok) {
+        const errStr = String(send.err?.message || send.err || "unknown error");
+        console.error("[/withdraw bg] RPC ERR:", errStr);
+
+        const msg = isWalletBusy(send.err)
+          ? "Wallet is busy. Try /withdraw again in a minute."
+          : /invalid|address/i.test(errStr)
+          ? "Invalid address."
+          : /insufficient|fund/i.test(errStr)
+          ? "Node wallet has insufficient funds."
+          : `Withdraw failed: ${errStr}`;
+
+        return dmLater(ctx, ctx.from.id, msg);
+      }
+
+      const txid = send.value;
+
+      await timed("record-withdrawal", async () => {
+        try {
+          await query(
+            `INSERT INTO public.withdrawals (user_id, to_address, amount_lites, txid, status, created_at)
+             VALUES ($1,$2,$3,$4,'sent', NOW())
+             ON CONFLICT (txid) DO NOTHING`,
+            [sender.id, toAddress, amount.toString(), txid]
+          );
+        } catch (e: any) {
+          console.error(
+            "[/withdraw bg] insert withdrawals ERR:",
+            e?.message || e
+          );
+        }
+
+        try {
+          await debit(sender.id, amount, "withdrawal", txid);
+          adjustBalanceCache(sender.id, -amount); // write-through
+        } catch (e: any) {
+          console.error("[/withdraw bg] debit ledger ERR:", e?.message || e);
+        }
+      });
+
+      const okMsg =
+        `Withdrawal sent.\n` +
+        `Amount: ${amtStr} LKY\n` +
+        `Address: \`${toAddress}\`\n` +
+        `TXID: \`${txid}\``;
+      dmLater(ctx, ctx.from.id, okMsg, { parse_mode: "Markdown" });
+      console.log("[/withdraw bg] ok", txid);
+    } catch (e: any) {
+      console.error("[/withdraw bg] ERR", e?.message || e);
+      dmLater(
+        ctx,
+        ctx.from.id,
+        "Withdraw failed unexpectedly. Please try again."
+      );
+    }
+  })();
 });
 
 // ---------- error & launch ----------
