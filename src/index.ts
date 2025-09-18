@@ -7,9 +7,10 @@ import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 
 // ---------- bot init ----------
+const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "3500"); // hard cap per Telegram call
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
-const bot = new Telegraf(botToken);
+const bot = new Telegraf(botToken, { handlerTimeout: 7000 });
 
 // ---------- perf knobs ----------
 const RESOLVE_USERNAME_TIMEOUT_MS = Number(
@@ -54,27 +55,37 @@ async function ensureUserCached(tg: any) {
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
-// delete the user's command only AFTER we replied (so it never “vanishes”)
-const deleteAfter = (ctx: any) => {
-  try {
-    if (isGroup(ctx) && ctx.message) ctx.deleteMessage().catch(() => {});
-  } catch {}
-};
+// basic timeout wrapper
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      }
+    );
+  });
+}
 
-const ephemeralReply = async (
-  ctx: any,
-  text: string,
-  ms = 8000,
-  extra: any = {}
-) => {
+// timing logs (to see where lag is)
+async function timed<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  const t0 = Date.now();
   try {
-    const m = await ctx.reply(text, extra);
-    if (isGroup(ctx))
-      setTimeout(() => ctx.deleteMessage(m.message_id).catch(() => {}), ms);
-  } catch {}
-};
+    const res = await fn();
+    console.log(`[timing] ${label} ${Date.now() - t0}ms`);
+    return res;
+  } catch (e) {
+    console.log(`[timing] ${label} ${Date.now() - t0}ms (ERR)`);
+    throw e;
+  }
+}
 
-// ---- Telegram send gate (prevents handlers from blocking under bursts) ----
+// ---- Telegram send gate (prevents bursts from piling up) ----
 let tgInflight = 0;
 const tgWaiters: Array<() => void> = [];
 async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
@@ -91,9 +102,66 @@ async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
+// safe wrappers for Telegram API calls (always time out)
+async function safeSend(
+  ctx: any,
+  chatId: number,
+  text: string,
+  extra: any = {}
+) {
+  return withTgGate(() =>
+    withTimeout(
+      ctx.telegram.sendMessage(chatId, text, extra),
+      TG_API_TIMEOUT_MS
+    )
+  );
+}
+type SentMessage = { message_id: number };
+
+async function safeReply(
+  ctx: any,
+  text: string,
+  extra: any = {}
+): Promise<SentMessage> {
+  return withTgGate(() =>
+    withTimeout(ctx.reply(text, extra), TG_API_TIMEOUT_MS)
+  ) as Promise<SentMessage>;
+}
+async function safeGetMe() {
+  return withTimeout(bot.telegram.getMe(), TG_API_TIMEOUT_MS);
+}
+async function safeGetChat(ctx: any, uname: string) {
+  return withTimeout(
+    ctx.telegram.getChat("@" + uname) as Promise<any>,
+    RESOLVE_USERNAME_TIMEOUT_MS
+  );
+}
+
+const deleteAfter = (ctx: any) => {
+  try {
+    if (isGroup(ctx) && ctx.message) ctx.deleteMessage().catch(() => {});
+  } catch {}
+};
+
+const ephemeralReply = async (
+  ctx: any,
+  text: string,
+  ms = 8000,
+  extra: any = {}
+) => {
+  try {
+    const m = (await safeReply(ctx, text, extra)) as { message_id?: number };
+    if (isGroup(ctx) && m?.message_id) {
+      setTimeout(() => {
+        ctx.deleteMessage(m.message_id!).catch(() => {});
+      }, ms);
+    }
+  } catch {}
+};
+
 const dm = async (ctx: any, text: string, extra: any = {}) => {
   try {
-    await withTgGate(() => ctx.telegram.sendMessage(ctx.from.id, text, extra));
+    await safeSend(ctx, ctx.from.id, text, extra);
     return true;
   } catch (e: any) {
     console.error("[dm] failed:", e?.message || e);
@@ -110,19 +178,17 @@ async function dmLater(
 ) {
   (async () => {
     try {
-      await withTgGate(() => ctx.telegram.sendMessage(chatId, text, extra));
+      await safeSend(ctx, chatId, text, extra);
       console.log("[dmLater] delivered", chatId);
     } catch (e: any) {
       const retry = (e as any)?.parameters?.retry_after;
       if (retry) {
         console.warn("[dmLater] flood-wait", retry, "s; chat", chatId);
         setTimeout(() => {
-          withTgGate(() => ctx.telegram.sendMessage(chatId, text, extra)).catch(
-            (err: unknown) => {
-              const msg = (err as any)?.message ?? err;
-              console.error("[dmLater] retry failed", chatId, msg);
-            }
-          );
+          safeSend(ctx, chatId, text, extra).catch((err: unknown) => {
+            const msg = (err as any)?.message ?? err;
+            console.error("[dmLater] retry failed", chatId, msg);
+          });
         }, (retry + 1) * 1000);
       } else {
         console.error("[dmLater] failed", chatId, (e as any)?.message || e);
@@ -136,7 +202,7 @@ let BOT_USER = "";
 async function getBotUsernameEnsured(ctx?: any): Promise<string> {
   if (BOT_USER) return BOT_USER;
   try {
-    const me = await bot.telegram.getMe();
+    const me = await safeGetMe();
     BOT_USER = me?.username || "";
   } catch {}
   if (!BOT_USER && (ctx as any)?.me?.username)
@@ -195,35 +261,6 @@ async function rpcTry<T>(
     return { ok: true, value: v };
   } catch (e: any) {
     return { ok: false, err: e };
-  }
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      }
-    );
-  });
-}
-
-// small helper to time steps in logs
-async function timed<T>(label: string, fn: () => Promise<T>): Promise<T> {
-  const t0 = Date.now();
-  try {
-    const res = await fn();
-    console.log(`[timing] ${label} ${Date.now() - t0}ms`);
-    return res;
-  } catch (e) {
-    console.log(`[timing] ${label} ${Date.now() - t0}ms (ERR)`);
-    throw e;
   }
 }
 
@@ -362,16 +399,21 @@ bot.command("health", async (ctx) => {
     out.push(`RPC: ERR ${e?.message || e}`);
   }
 
-  await ctx.reply(out.join("\n"));
+  try {
+    const me = await safeGetMe();
+    out.push(`BOT: @${me?.username || "unknown"}`);
+  } catch {
+    out.push("BOT: getMe timeout");
+  }
+
+  await safeReply(ctx, out.join("\n"));
 });
 
 // ---------- commands ----------
 bot.start(async (ctx) => {
-  // ensure user exists (hot-path cached)
   const u = await ensureUserCached(ctx.from);
   const newUname = ctx.from.username || null;
 
-  // one round-trip: read previous + update only if needed
   const sql = `
     WITH prev AS (
       SELECT id, has_started, username
@@ -401,19 +443,19 @@ bot.start(async (ctx) => {
   ]);
   const wasStarted = r.rows[0]?.was_started === true;
 
-  // Deep-link payload when user came from ?start=...
   const payload =
     (ctx as any).startPayload || (ctx.message?.text?.split(/\s+/, 2)[1] ?? "");
   if (payload) {
     const m = /^claim-(\d+)-(\d+)$/.exec(payload);
     if (m && Number(m[1]) === Number(ctx.from.id)) {
       const first = ctx.from.first_name || "friend";
-      await ctx.reply(
+      await safeReply(
+        ctx,
         `Welcome, ${esc(
           first
         )}! 🎉\nYour wallet is now activated and the pending tip was credited.\nSend /balance to check it.`
       );
-      if (isGroup(ctx)) deleteAfter(ctx); // delete /start in groups
+      if (isGroup(ctx)) deleteAfter(ctx);
       return;
     }
   }
@@ -423,7 +465,6 @@ bot.start(async (ctx) => {
     : `Welcome to LuckyCoin Tipbot.\nType /help for commands.`;
 
   if (isGroup(ctx)) {
-    // immediate ack so it never feels frozen
     await ephemeralReply(
       ctx,
       `Sent you a DM with details. If you don't see it, tap ${await botMention(
@@ -431,10 +472,10 @@ bot.start(async (ctx) => {
       )}.`,
       5000
     );
-    dmLater(ctx, ctx.from.id, msg); // fire-and-forget DM
-    deleteAfter(ctx); // always delete the /start in group
+    dmLater(ctx, ctx.from.id, msg);
+    deleteAfter(ctx);
   } else {
-    await ctx.reply(msg); // normal DM chat
+    await safeReply(ctx, msg);
   }
 });
 
@@ -458,7 +499,7 @@ bot.help(async (ctx) => {
         6000
       );
   } else {
-    await ctx.reply(text, { parse_mode: "Markdown" });
+    await safeReply(ctx, text, { parse_mode: "Markdown" });
   }
 });
 
@@ -469,11 +510,9 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
   const uname = unameRaw.replace(/^@/, "");
   const key = uname.toLowerCase();
 
-  // 1) tiny cache
   const hit = unameCache.get(key);
   if (hit && Date.now() - hit.ts < USERNAME_CACHE_MS) return hit.id;
 
-  // 2) DB first (use stored function)
   const inDb = await findUserByUsername(uname);
   if (inDb) {
     const id = Number(inDb.tg_user_id);
@@ -481,23 +520,17 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
     return id;
   }
 
-  // 3) Telegram getChat with short timeout (avoid long stalls)
   try {
-    const chat = (await withTimeout(
-      ctx.telegram.getChat("@" + uname) as Promise<any>,
-      RESOLVE_USERNAME_TIMEOUT_MS
-    )) as TgChatMinimal;
-
+    const chat = (await safeGetChat(ctx, uname)) as TgChatMinimal;
     if (chat?.id != null) {
-      await ensureUserCached({ id: chat.id, username: uname } as any); // persist minimal
+      await ensureUserCached({ id: chat.id, username: uname } as any);
       const id = Number(chat.id);
       unameCache.set(key, { id, ts: Date.now() });
       return id;
     }
   } catch {
-    // timeout or error → fall through
+    // timeout or error
   }
-
   return null;
 }
 
@@ -515,7 +548,7 @@ bot.command("deposit", async (ctx) => {
       await ephemeralReply(ctx, msg, 12000, { parse_mode: "Markdown" });
       dmLater(ctx, ctx.from.id, msg, { parse_mode: "Markdown" });
     } else {
-      await ctx.reply(msg, { parse_mode: "Markdown" });
+      await safeReply(ctx, msg, { parse_mode: "Markdown" });
     }
   };
 
@@ -562,7 +595,7 @@ bot.command("deposit", async (ctx) => {
           6000
         );
     } else {
-      await ctx.reply(msg);
+      await safeReply(ctx, msg);
     }
   }
 });
@@ -572,7 +605,7 @@ bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUserCached(ctx.from);
-    const bal = await getBalanceCached(user.id); // <- cached
+    const bal = await getBalanceCached(user.id);
     const text = `Balance: ${formatLky(bal, decimals)} LKY`;
     if (isGroup(ctx)) {
       const ok = await dm(ctx, text);
@@ -586,9 +619,9 @@ bot.command("balance", async (ctx) => {
         );
       }
     } else {
-      await ctx.reply(text);
+      await safeReply(ctx, text);
     }
-    console.log("[/balance] ok]");
+    console.log("[/balance] ok");
   } catch (e: any) {
     console.error("[/balance] ERR", e?.message || e);
     await ephemeralReply(
@@ -599,7 +632,7 @@ bot.command("balance", async (ctx) => {
   }
 });
 
-// ----- /tip ----- (optimized: fewer sequential awaits; fast username resolve)
+// ----- /tip ----- (optimized; fast username resolve)
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
@@ -663,7 +696,7 @@ bot.command("tip", async (ctx) => {
         const ok = await dm(ctx, msg);
         if (!ok) await ephemeralReply(ctx, msg, 8000);
       } else {
-        await ctx.reply(msg);
+        await safeReply(ctx, msg);
       }
       return;
     }
@@ -733,13 +766,11 @@ bot.command("tip", async (ctx) => {
     ((to as any).username && `@${(to as any).username}`) ||
     (unameFromCmd ? unameFromCmd : `user ${to.id}`);
 
-  // Deep link encodes the intended recipient's Telegram ID if they haven't started yet
   const recipientTgId = replyTo?.id ?? targetUserId!;
   const deepLink = needsStart
     ? await botDeepLink(ctx, `claim-${recipientTgId}-${Date.now()}`)
     : "";
 
-  // 1) reply to chat immediately (with optional START button) — HTML parse mode
   const lines = [
     `💸 ${esc(fromName)} tipped ${esc(pretty)} LKY to ${esc(toDisplay)}`,
     `HODL LuckyCoin for eternal good luck! 🍀`,
@@ -754,10 +785,9 @@ bot.command("tip", async (ctx) => {
   const kb = needsStart && deepLink ? startKb(deepLink) : undefined;
   const extra: any = { parse_mode: "HTML" };
   if (kb) extra.reply_markup = kb.reply_markup;
-  await ctx.reply(lines.join("\n"), extra);
+  await safeReply(ctx, lines.join("\n"), extra);
   deleteAfter(ctx);
 
-  // 2) background DM (non-blocking)
   const dmText = [
     `🎉 You’ve been tipped ${esc(pretty)} LKY by ${esc(fromName)}.`,
     needsStart
@@ -793,7 +823,7 @@ bot.command("withdraw", async (ctx) => {
           6000
         );
     } else {
-      await ctx.reply(msg);
+      await safeReply(ctx, msg);
     }
     return;
   }
@@ -808,7 +838,7 @@ bot.command("withdraw", async (ctx) => {
       const ok = await dm(ctx, msg);
       if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
-      await ctx.reply(msg);
+      await safeReply(ctx, msg);
     }
     return;
   }
@@ -818,12 +848,11 @@ bot.command("withdraw", async (ctx) => {
       const ok = await dm(ctx, msg);
       if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
-      await ctx.reply(msg);
+      await safeReply(ctx, msg);
     }
     return;
   }
 
-  // quick balance check (cached)
   const bal = await getBalanceCached(sender.id);
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
@@ -834,20 +863,19 @@ bot.command("withdraw", async (ctx) => {
       const ok = await dm(ctx, msg);
       if (!ok) await ephemeralReply(ctx, "Please DM me first.", 6000);
     } else {
-      await ctx.reply(msg);
+      await safeReply(ctx, msg);
     }
     return;
   }
 
   const amtStr = formatLky(amount, 8);
 
-  // immediate ack so chat doesn't block
   const ack = `Processing your withdrawal...\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nI'll DM you the result.`;
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, ack, 6000, { parse_mode: "Markdown" });
     deleteAfter(ctx);
   } else {
-    await ctx.reply(ack, { parse_mode: "Markdown" });
+    await safeReply(ctx, ack, { parse_mode: "Markdown" });
   }
 
   // background work
@@ -900,7 +928,7 @@ bot.command("withdraw", async (ctx) => {
 
         try {
           await debit(sender.id, amount, "withdrawal", txid);
-          adjustBalanceCache(sender.id, -amount); // write-through
+          adjustBalanceCache(sender.id, -amount);
         } catch (e: any) {
           console.error("[/withdraw bg] debit ledger ERR:", e?.message || e);
         }
@@ -928,7 +956,7 @@ bot.command("withdraw", async (ctx) => {
 bot.catch((err) => console.error("Bot error", err));
 
 bot.launch({ dropPendingUpdates: true }).then(async () => {
-  await ensureSetup(); // indexes + has_started
+  await ensureSetup();
   await getBotUsernameEnsured();
   console.log("Tipbot is running.");
 });
