@@ -1,6 +1,7 @@
 // src/index.ts
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { rpc } from "./rpc.js";
 import { query } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
@@ -116,6 +117,7 @@ async function safeSend(
     )
   );
 }
+
 type SentMessage = { message_id: number };
 
 async function safeReply(
@@ -127,6 +129,7 @@ async function safeReply(
     withTimeout(ctx.reply(text, extra), TG_API_TIMEOUT_MS)
   ) as Promise<SentMessage>;
 }
+
 async function safeGetMe() {
   return withTimeout(bot.telegram.getMe(), TG_API_TIMEOUT_MS);
 }
@@ -621,7 +624,7 @@ bot.command("balance", async (ctx) => {
     } else {
       await safeReply(ctx, text);
     }
-    console.log("[/balance] ok");
+    console.log("[/balance] ok]");
   } catch (e: any) {
     console.error("[/balance] ERR", e?.message || e);
     await ephemeralReply(
@@ -803,7 +806,7 @@ bot.command("tip", async (ctx) => {
 
 // ----- /withdraw -----  (instant ack + background RPC)
 bot.command("withdraw", async (ctx) => {
-  console.log("[/withdraw] start");
+  console.log("[/withdraw] start]");
   const sender = await ensureUserCached(ctx.from);
 
   const text = ctx.message?.text || "";
@@ -955,7 +958,16 @@ bot.command("withdraw", async (ctx) => {
 // ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
-bot.launch({ dropPendingUpdates: true }).then(async () => {
+// Event-loop lag monitor: prints if the loop is congested
+const loopLag = monitorEventLoopDelay({ resolution: 20 });
+loopLag.enable();
+setInterval(() => {
+  const p95 = Math.round(loopLag.percentile(95));
+  if (p95 > 200) console.warn(`[health] event-loop p95 lag=${p95}ms`);
+}, 10_000);
+
+// Launch with tighter polling
+bot.launch().then(async () => {
   await ensureSetup();
   await getBotUsernameEnsured();
   console.log("Tipbot is running.");
