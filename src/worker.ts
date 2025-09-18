@@ -2,8 +2,8 @@
 // Deposit worker – RPC or Explorer (Luckyscan), selectable via env
 import "dotenv/config";
 import { rpc } from "./rpc.js";
-import { query } from "./db.js";
-import { ensureUser, credit } from "./ledger.js";
+import { query, withClient } from "./db.js";
+import { ensureUser, creditWithClient } from "./ledger.js";
 
 const MIN_CONF = Number(process.env.MIN_CONFIRMATIONS || "6");
 const POLL_MS = 30_000;
@@ -78,7 +78,7 @@ async function scanOnceRpc() {
 
     // Idempotency via (txid,vout)
     const exists = await query(
-      "SELECT 1 FROM deposits WHERE txid = $1 AND vout = $2",
+      "SELECT 1 FROM public.deposits WHERE txid = $1 AND vout = $2",
       [t.txid, t.vout]
     );
     if (exists.rows.length) continue;
@@ -87,33 +87,41 @@ async function scanOnceRpc() {
     const user = await ensureUser({ id: tgId });
     const amountLites = BigInt(Math.round(Number(t.amount) * 1e8));
 
-    await query("BEGIN");
-    try {
-      await query(
-        `INSERT INTO deposits (user_id, txid, vout, amount_lites, confirmations, credited, created_at)
-         VALUES ($1,$2,$3,$4,$5,$6, to_timestamp(COALESCE($7, extract(epoch from NOW()))))`,
-        [
+    await withClient(async (c) => {
+      await c.query("BEGIN");
+      try {
+        await c.query(
+          `INSERT INTO public.deposits (user_id, txid, vout, amount_lites, confirmations, credited, created_at)
+           VALUES ($1,$2,$3,$4,$5,$6, to_timestamp(COALESCE($7, extract(epoch from NOW()))))`,
+          [
+            user.id,
+            t.txid,
+            t.vout,
+            String(amountLites),
+            t.confirmations,
+            true,
+            t.time ?? null,
+          ]
+        );
+
+        // ledger ref = txid:vout → idempotent at ledger level too
+        await creditWithClient(
+          c,
           user.id,
-          t.txid,
-          t.vout,
-          String(amountLites),
-          t.confirmations,
-          true,
-          t.time ?? null,
-        ]
-      );
+          amountLites,
+          "deposit",
+          `${t.txid}:${t.vout}`
+        );
 
-      // ledger ref = txid:vout → idempotent at ledger level too
-      await credit(user.id, amountLites, "deposit", `${t.txid}:${t.vout}`);
-
-      await query("COMMIT");
-      console.log(
-        `Credited deposit ${t.txid}:${t.vout} to user ${user.id} (RPC)`
-      );
-    } catch (e) {
-      await query("ROLLBACK").catch(() => {});
-      console.error("Failed to record deposit (RPC path)", e);
-    }
+        await c.query("COMMIT");
+        console.log(
+          `Credited deposit ${t.txid}:${t.vout} to user ${user.id} (RPC)`
+        );
+      } catch (e) {
+        await c.query("ROLLBACK").catch(() => {});
+        console.error("Failed to record deposit (RPC path)", e);
+      }
+    });
   }
 }
 
@@ -149,7 +157,7 @@ async function scanOnceExplorer() {
 
         // Idempotency guard
         const exists = await query(
-          "SELECT 1 FROM deposits WHERE txid=$1 AND vout=$2",
+          "SELECT 1 FROM public.deposits WHERE txid=$1 AND vout=$2",
           [tx.txid, vout]
         );
         if (exists.rows.length) continue;
@@ -161,24 +169,40 @@ async function scanOnceExplorer() {
             ? new Date(tx.status.block_time * 1000)
             : new Date();
 
-        await query("BEGIN");
-        try {
-          await query(
-            `INSERT INTO deposits (user_id, txid, vout, amount_lites, confirmations, credited, created_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-            [user_id, tx.txid, vout, String(amountLites), conf, true, createdAt]
-          );
+        await withClient(async (c) => {
+          await c.query("BEGIN");
+          try {
+            await c.query(
+              `INSERT INTO public.deposits (user_id, txid, vout, amount_lites, confirmations, credited, created_at)
+               VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+              [
+                user_id,
+                tx.txid,
+                vout,
+                String(amountLites),
+                conf,
+                true,
+                createdAt,
+              ]
+            );
 
-          await credit(user_id, amountLites, "deposit", `${tx.txid}:${vout}`);
+            await creditWithClient(
+              c,
+              user_id,
+              amountLites,
+              "deposit",
+              `${tx.txid}:${vout}`
+            );
 
-          await query("COMMIT");
-          console.log(
-            `Credited deposit ${tx.txid}:${vout} to user ${user_id} (Explorer)`
-          );
-        } catch (e) {
-          await query("ROLLBACK").catch(() => {});
-          console.error("Failed to record deposit (Explorer path)", e);
-        }
+            await c.query("COMMIT");
+            console.log(
+              `Credited deposit ${tx.txid}:${vout} to user ${user_id} (Explorer)`
+            );
+          } catch (e) {
+            await c.query("ROLLBACK").catch(() => {});
+            console.error("Failed to record deposit (Explorer path)", e);
+          }
+        });
       }
     }
   }

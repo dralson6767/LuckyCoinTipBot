@@ -94,8 +94,8 @@ export async function getBalanceLitesWithClient(
     SELECT COALESCE(u.transferred_tip_lites, 0)
          + COALESCE(SUM(CASE WHEN l.reason IN ('deposit','withdrawal') THEN l.delta_lites ELSE 0 END), 0)
       AS balance_lites
-    FROM users u
-    LEFT JOIN ledger l ON l.user_id = u.id
+    FROM public.users u
+    LEFT JOIN public.ledger l ON l.user_id = u.id
     WHERE u.id = $1
     GROUP BY u.transferred_tip_lites
     `,

@@ -1,15 +1,20 @@
-import { query } from "./db.js";
+// src/ledger.ts
+import {
+  query,
+  withClient,
+  type PoolClient,
+  getBalanceLitesWithClient,
+} from "./db.js";
 
 /**
  * Ledger + Users helpers with compacted tip logic.
  *
- * Balances are now computed as:
+ * Balances are computed as:
  *   balance_lites = users.transferred_tip_lites
  *                 + SUM(ledger.delta_lites WHERE reason IN ('deposit','withdrawal'))
  *
  * Tip operations (transfer) update `users.transferred_tip_lites` directly,
- * and may still write paired tip rows to `ledger` (for audit),
- * but those rows are no longer used in balance calculations.
+ * and we still write paired tip rows to `ledger` for audit (not used for balance).
  */
 
 // -----------------------------------------------------------------------------
@@ -120,23 +125,25 @@ export async function findUserByUsername(
 }
 
 // -----------------------------------------------------------------------------
-// Ledger insert helpers
+// Ledger insert helpers (client-safe variants + pool wrappers)
 // -----------------------------------------------------------------------------
 
-/** Internal: find an existing ledger row id by (reason, ref). */
-async function findLedgerIdByRef(
+/** Internal: find an existing ledger row id by (reason, ref) using a specific client. */
+async function findLedgerIdByRefWithClient(
+  c: PoolClient,
   reason: LedgerReason,
   ref: string
 ): Promise<number | null> {
-  const r = await query<{ id: number }>(
+  const r = await c.query<{ id: number }>(
     `SELECT id FROM public.ledger WHERE reason = $1 AND ref = $2 LIMIT 1`,
     [reason, ref]
   );
-  return r.rows[0]?.id ?? null;
+  return (r.rows[0] as any)?.id ?? null;
 }
 
-/** Internal: insert a ledger row idempotently using the UNIQUE (reason, ref). */
-async function insertLedger(
+/** Internal: insert a ledger row idempotently (UNIQUE(reason,ref)) on a specific client. */
+async function insertLedgerWithClient(
+  c: PoolClient,
   userId: number,
   delta: bigint,
   reason: LedgerReason,
@@ -144,18 +151,32 @@ async function insertLedger(
   at?: Date
 ): Promise<number | null> {
   const ts = (at ?? new Date()).toISOString();
-  const res = await query<{ id: number }>(
+  const res = await c.query<{ id: number }>(
     `INSERT INTO public.ledger(user_id, delta_lites, reason, ref, created_at)
        VALUES ($1, $2::bigint, $3, $4, $5)
      ON CONFLICT ON CONSTRAINT ledger_reason_ref_unique DO NOTHING
      RETURNING id`,
     [userId, delta.toString(), reason, ref, ts]
   );
-  return res.rows[0]?.id ?? null;
+  return (res.rows[0] as any)?.id ?? null;
 }
 
-/** Internal: record a tip audit row (idempotent; relies on a UNIQUE in tips). */
-async function recordTipAudit(
+/** Pool wrapper (kept for any legacy single-call uses). */
+async function insertLedger(
+  userId: number,
+  delta: bigint,
+  reason: LedgerReason,
+  ref: string,
+  at?: Date
+): Promise<number | null> {
+  return withClient((c) =>
+    insertLedgerWithClient(c, userId, delta, reason, ref, at)
+  );
+}
+
+/** Internal: record a tip audit row on a specific client. */
+async function recordTipAuditWithClient(
+  c: PoolClient,
   fromUserId: number,
   toUserId: number,
   amountLites: bigint,
@@ -163,7 +184,7 @@ async function recordTipAudit(
   ledgerOutId: number | null,
   ledgerInId: number | null
 ): Promise<void> {
-  await query(
+  await c.query(
     `INSERT INTO public.tips (from_user_id, to_user_id, amount_lites, created_at, ledger_out_id, ledger_in_id)
      VALUES ($1,$2,$3,$4,$5,$6)
      ON CONFLICT DO NOTHING`,
@@ -178,8 +199,13 @@ async function recordTipAudit(
   );
 }
 
-/** CREDIT: positive delta (exported for scan_explorer/worker). */
-export async function credit(
+// -----------------------------------------------------------------------------
+// Credits / Debits (export both client+pool versions)
+// -----------------------------------------------------------------------------
+
+/** CREDIT with an existing client (preferred inside transactions). */
+export async function creditWithClient(
+  c: PoolClient,
   userId: number,
   amountLites: bigint | number | string,
   reason: LedgerReason,
@@ -189,11 +215,25 @@ export async function credit(
   const amt =
     typeof amountLites === "bigint" ? amountLites : BigInt(String(amountLites));
   if (amt <= 0n) throw new Error("credit amount must be > 0");
-  return insertLedger(userId, amt, reason, ref, at);
+  return insertLedgerWithClient(c, userId, amt, reason, ref, at);
 }
 
-/** DEBIT: negative delta (exported in case any caller uses it). */
-export async function debit(
+/** CREDIT pool wrapper. */
+export async function credit(
+  userId: number,
+  amountLites: bigint | number | string,
+  reason: LedgerReason,
+  ref: string,
+  at?: Date
+): Promise<number | null> {
+  return withClient((c) =>
+    creditWithClient(c, userId, amountLites, reason, ref, at)
+  );
+}
+
+/** DEBIT with an existing client (preferred inside transactions). */
+export async function debitWithClient(
+  c: PoolClient,
   userId: number,
   amountLites: bigint | number | string,
   reason: LedgerReason,
@@ -203,24 +243,32 @@ export async function debit(
   const amt =
     typeof amountLites === "bigint" ? amountLites : BigInt(String(amountLites));
   if (amt <= 0n) throw new Error("debit amount must be > 0");
-  return insertLedger(userId, -amt, reason, ref, at);
+  return insertLedgerWithClient(c, userId, -amt, reason, ref, at);
+}
+
+/** DEBIT pool wrapper (kept for existing callers like /withdraw). */
+export async function debit(
+  userId: number,
+  amountLites: bigint | number | string,
+  reason: LedgerReason,
+  ref: string,
+  at?: Date
+): Promise<number | null> {
+  return withClient((c) =>
+    debitWithClient(c, userId, amountLites, reason, ref, at)
+  );
 }
 
 // -----------------------------------------------------------------------------
-// Transfers (tips)
+// Transfers (tips) — fully transaction-safe on ONE client
 // -----------------------------------------------------------------------------
 
 /**
- * High-level tip transfer between users.
- * - Ensures sufficient balance using compacted logic.
- * - Writes paired tip rows to ledger (audit only; balances ignore them).
- * - Updates users.transferred_tip_lites for both users so balances remain correct
- *   even if tip rows are later pruned.
- *
- * NOTE: This uses multiple statements. If your ./db.js "query" does not keep a
- * single connection across BEGIN/COMMIT, consider refactoring to run these
- * inside one multi-statement call or a client/transaction helper. For now,
- * this mirrors your existing pattern.
+ * Tip transfer between users, fully atomic:
+ * - Validates balance on the same connection
+ * - Writes ledger audit rows (idempotent) on the same connection
+ * - Updates users.transferred_tip_lites for both users
+ * - Records app-side tip audit
  */
 export async function transfer(
   fromUserId: number,
@@ -230,44 +278,68 @@ export async function transfer(
   if (amountLites <= 0n) throw new Error("Amount must be positive");
   if (fromUserId === toUserId) throw new Error("Cannot tip yourself");
 
-  const bal = await balanceLites(fromUserId);
-  if (bal < amountLites) throw new Error("Insufficient balance");
-
   const now = new Date();
   const ref = `tip:${now.getTime()}:${fromUserId}->${toUserId}:${amountLites.toString()}`;
 
-  await query("BEGIN");
-  try {
-    // (1) Optional audit rows (kept for history/pairing; not used in balance)
-    let outId = await insertLedger(
-      fromUserId,
-      -amountLites,
-      "tip_out",
-      ref,
-      now
-    );
-    let inId = await insertLedger(toUserId, amountLites, "tip_in", ref, now);
+  await withClient(async (c) => {
+    await c.query("BEGIN");
+    try {
+      // 1) Balance check on THIS connection
+      const bal = await getBalanceLitesWithClient(c, fromUserId);
+      if (bal < amountLites) {
+        await c.query("ROLLBACK");
+        throw new Error("Insufficient balance");
+      }
 
-    // If concurrent insert raced, fetch existing IDs by (reason, ref)
-    if (outId === null) outId = await findLedgerIdByRef("tip_out", ref);
-    if (inId === null) inId = await findLedgerIdByRef("tip_in", ref);
+      // 2) Optional audit rows
+      let outId = await insertLedgerWithClient(
+        c,
+        fromUserId,
+        -amountLites,
+        "tip_out",
+        ref,
+        now
+      );
+      let inId = await insertLedgerWithClient(
+        c,
+        toUserId,
+        amountLites,
+        "tip_in",
+        ref,
+        now
+      );
 
-    // (2) Update compacted totals on users (authoritative for balances)
-    await query(
-      `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites - $1 WHERE id = $2`,
-      [amountLites.toString(), fromUserId]
-    );
-    await query(
-      `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites + $1 WHERE id = $2`,
-      [amountLites.toString(), toUserId]
-    );
+      // If concurrent insert raced, fetch existing IDs by (reason, ref)
+      if (outId === null)
+        outId = await findLedgerIdByRefWithClient(c, "tip_out", ref);
+      if (inId === null)
+        inId = await findLedgerIdByRefWithClient(c, "tip_in", ref);
 
-    // (3) App-side tip audit (no DB trigger/function dependency)
-    await recordTipAudit(fromUserId, toUserId, amountLites, now, outId, inId);
+      // 3) Update compacted totals on users (authoritative for balances)
+      await c.query(
+        `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites - $1 WHERE id = $2`,
+        [amountLites.toString(), fromUserId]
+      );
+      await c.query(
+        `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites + $1 WHERE id = $2`,
+        [amountLites.toString(), toUserId]
+      );
 
-    await query("COMMIT");
-  } catch (e) {
-    await query("ROLLBACK");
-    throw e;
-  }
+      // 4) App-side tip audit
+      await recordTipAuditWithClient(
+        c,
+        fromUserId,
+        toUserId,
+        amountLites,
+        now,
+        outId,
+        inId
+      );
+
+      await c.query("COMMIT");
+    } catch (e) {
+      await c.query("ROLLBACK").catch(() => {});
+      throw e;
+    }
+  });
 }
