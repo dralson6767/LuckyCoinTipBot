@@ -5,38 +5,14 @@ import { rpc } from "./rpc.js";
 import { query } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
-import { createRequire } from "module";
 import * as https from "node:https";
 
-(() => {
-  // Try undici if present; otherwise fall back to core https keep-alive.
-  try {
-    const req = createRequire(import.meta.url);
-    const undici: any = req("undici"); // no type dependency
-    if (undici?.setGlobalDispatcher && undici?.Agent) {
-      undici.setGlobalDispatcher(
-        new undici.Agent({
-          keepAliveTimeout: 30_000,
-          keepAliveMaxTimeout: 60_000,
-        })
-      );
-      console.log("[net] undici keep-alive enabled");
-      return;
-    }
-  } catch {
-    // undici not installed / incompatible -> use https fallback
-  }
-
-  // Fallback: replace the global HTTPS agent with a keep-alive agent
-  const ka = new https.Agent({ keepAlive: true, maxSockets: 64 });
-  (https as any).globalAgent = ka; // assign new agent
-  console.log("[net] https keep-alive enabled (fallback)");
-})();
-
-// ---------- bot init ----------
+// ---------- bot init (safe HTTPS keep-alive, no globals) ----------
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
-const bot = new Telegraf(botToken);
+
+const httpsKA = new https.Agent({ keepAlive: true, maxSockets: 64 });
+const bot = new Telegraf(botToken, { telegram: { agent: httpsKA } } as any);
 
 // ---------- perf knobs ----------
 const RESOLVE_USERNAME_TIMEOUT_MS = Number(
