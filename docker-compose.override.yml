@@ -1,0 +1,8 @@
+# docker-compose.override.yml
+services:
+  worker:
+    environment:
+      EXPLORER_ENABLED: "false" # prefer RPC only
+      EXPLORER_TIMEOUT_MS: "3000" # fast fail just in case you re-enable
+    extra_hosts:
+      - "luckyscan.org:127.0.0.1" # fail explorer instantly (no 10s stall)

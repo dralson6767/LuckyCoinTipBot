@@ -1,21 +1,29 @@
 // src/worker.ts
-// Deposit worker – RPC or Explorer (Luckyscan), selectable via env
+// Deposit worker – prefers RPC; Explorer optional via env.
+// Non-destructive, idempotent inserts + ledger credit.
+
 import "dotenv/config";
 import { rpc } from "./rpc.js";
 import { query, withClient } from "./db.js";
 import { ensureUser, creditWithClient } from "./ledger.js";
+import { scanOnceExplorer } from "./scan_explorer.js";
 
-const MIN_CONF = Number(process.env.MIN_CONFIRMATIONS || "6");
-const POLL_MS = 30_000;
-const USE_EXPLORER = process.env.LKY_USE_EXPLORER === "true";
-const EXPLORER_BASE =
-  process.env.LKY_EXPLORER_BASE || "https://luckyscan.org/api";
+const MIN_CONF = Number(process.env.MIN_CONFIRMATIONS ?? "6");
+const POLL_MS = Number(process.env.WORKER_POLL_MS ?? "30000");
+
+// EXPLORER_ENABLED accepts EXPLORER_ENABLED / LKY_USE_EXPLORER / USE_EXPLORER
+const EXPLORER_ENABLED = /^(1|true|yes)$/i.test(
+  (process.env.EXPLORER_ENABLED ??
+    process.env.LKY_USE_EXPLORER ??
+    process.env.USE_EXPLORER ??
+    "false") as string
+);
 
 // ---------- Types ----------
 type TxItem = {
   address: string;
   category: string; // "receive" | "send" | ...
-  amount: number;
+  amount: number | string;
   label?: string;
   confirmations: number;
   txid: string;
@@ -23,45 +31,15 @@ type TxItem = {
   time?: number;
 };
 
-type ExplorerVout = { scriptpubkey_address?: string; value: number };
-type ExplorerTx = {
-  txid: string;
-  vout: ExplorerVout[];
-  status: { confirmed: boolean; block_height?: number; block_time?: number };
-};
-
-// ---------- Minimal HTTP helpers (built-in fetch) ----------
-async function httpGetJSON<T>(path: string): Promise<T> {
-  const res = await fetch(EXPLORER_BASE + path, { method: "GET" });
-  if (!res.ok) throw new Error(`Explorer HTTP ${res.status} for ${path}`);
-  return (await res.json()) as T;
-}
-async function httpGetText(path: string): Promise<string> {
-  const res = await fetch(EXPLORER_BASE + path, { method: "GET" });
-  if (!res.ok) throw new Error(`Explorer HTTP ${res.status} for ${path}`);
-  return await res.text();
-}
-
-// ---------- Explorer helpers ----------
-async function getTipHeight(): Promise<number> {
-  const txt = await httpGetText("/blocks/tip/height");
-  return Number(txt);
-}
-async function getAddressTxs(address: string): Promise<ExplorerTx[]> {
-  // First page (newest + mempool)
-  return await httpGetJSON<ExplorerTx[]>(`/address/${address}/txs`);
-}
-
-// ---------- RPC scan (original logic) ----------
+// ---------- RPC scan ----------
 async function scanOnceRpc() {
-  // Pull plenty so we don't miss older confirmations
+  // Pull enough history so we don’t miss late confirmations
   const txs = await rpc<TxItem[]>("listtransactions", ["*", 1000, 0, true]);
 
-  // Only receives with enough confs AND a numeric label (label == Telegram user id)
   const receives = txs.filter(
     (t) =>
       t.category === "receive" &&
-      (t.confirmations ?? 0) >= MIN_CONF &&
+      (Number(t.confirmations) || 0) >= MIN_CONF &&
       t.label &&
       /^\d+$/.test(String(t.label))
   );
@@ -76,9 +54,9 @@ async function scanOnceRpc() {
       continue;
     }
 
-    // Idempotency via (txid,vout)
+    // Idempotency guard (txid,vout)
     const exists = await query(
-      "SELECT 1 FROM public.deposits WHERE txid = $1 AND vout = $2",
+      "SELECT 1 FROM public.deposits WHERE txid=$1 AND vout=$2",
       [t.txid, t.vout]
     );
     if (exists.rows.length) continue;
@@ -91,7 +69,8 @@ async function scanOnceRpc() {
       await c.query("BEGIN");
       try {
         await c.query(
-          `INSERT INTO public.deposits (user_id, txid, vout, amount_lites, confirmations, credited, created_at)
+          `INSERT INTO public.deposits
+             (user_id, txid, vout, amount_lites, confirmations, credited, created_at)
            VALUES ($1,$2,$3,$4,$5,$6, to_timestamp(COALESCE($7, extract(epoch from NOW()))))`,
           [
             user.id,
@@ -104,7 +83,7 @@ async function scanOnceRpc() {
           ]
         );
 
-        // ledger ref = txid:vout → idempotent at ledger level too
+        // ledger ref = txid:vout → idempotent on ledger side too
         await creditWithClient(
           c,
           user.id,
@@ -125,115 +104,54 @@ async function scanOnceRpc() {
   }
 }
 
-// ---------- Explorer scan (Luckyscan/Esplora) ----------
-async function scanOnceExplorer() {
-  const tip = await getTipHeight();
+// ---------- Orchestrator ----------
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-  // We scan known deposit addresses; each is already mapped to a user_id
-  const addrs = await query(
-    "SELECT user_id, address FROM public.wallet_addresses"
+let stopping = false;
+process.on("SIGTERM", () => {
+  if (!stopping)
+    console.log("[worker] SIGTERM received; shutting down after current loop…");
+  stopping = true;
+});
+process.on("SIGINT", () => {
+  if (!stopping)
+    console.log("[worker] SIGINT received; shutting down after current loop…");
+  stopping = true;
+});
+
+async function loop() {
+  console.log(
+    `Deposit worker running (every ${Math.round(
+      POLL_MS / 1000
+    )}s, min confs=${MIN_CONF}, explorer=${EXPLORER_ENABLED})`
   );
-
-  for (const row of addrs.rows as Array<{ user_id: number; address: string }>) {
-    const { user_id, address } = row;
-
-    let txs: ExplorerTx[] = [];
+  while (!stopping) {
+    const start = Date.now();
     try {
-      txs = await getAddressTxs(address);
+      // Prefer RPC; keep Explorer optional and isolated so it never blocks RPC progress
+      await scanOnceRpc();
     } catch (e) {
-      console.error(`Explorer fetch error for ${address}`, e);
-      continue;
+      console.error("scanOnceRpc error", (e as Error)?.message ?? e);
     }
 
-    for (const tx of txs) {
-      if (!tx?.status?.confirmed) continue; // only credit confirmed
-      const h = tx.status.block_height || 0;
-      const conf = h ? Math.max(0, tip - h + 1) : 0;
-      if (conf < MIN_CONF) continue;
-
-      for (let vout = 0; vout < tx.vout.length; vout++) {
-        const out = tx.vout[vout];
-        if (out.scriptpubkey_address !== address) continue;
-
-        // Idempotency guard
-        const exists = await query(
-          "SELECT 1 FROM public.deposits WHERE txid=$1 AND vout=$2",
-          [tx.txid, vout]
-        );
-        if (exists.rows.length) continue;
-
-        // value is already in smallest unit (lites)
-        const amountLites = BigInt(out.value);
-        const createdAt =
-          tx.status.block_time != null
-            ? new Date(tx.status.block_time * 1000)
-            : new Date();
-
-        await withClient(async (c) => {
-          await c.query("BEGIN");
-          try {
-            await c.query(
-              `INSERT INTO public.deposits (user_id, txid, vout, amount_lites, confirmations, credited, created_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-              [
-                user_id,
-                tx.txid,
-                vout,
-                String(amountLites),
-                conf,
-                true,
-                createdAt,
-              ]
-            );
-
-            await creditWithClient(
-              c,
-              user_id,
-              amountLites,
-              "deposit",
-              `${tx.txid}:${vout}`
-            );
-
-            await c.query("COMMIT");
-            console.log(
-              `Credited deposit ${tx.txid}:${vout} to user ${user_id} (Explorer)`
-            );
-          } catch (e) {
-            await c.query("ROLLBACK").catch(() => {});
-            console.error("Failed to record deposit (Explorer path)", e);
-          }
-        });
+    if (EXPLORER_ENABLED) {
+      try {
+        await scanOnceExplorer();
+      } catch (e) {
+        console.error("scanOnceExplorer error", (e as Error)?.message ?? e);
       }
     }
+
+    const elapsed = Date.now() - start;
+    const wait = Math.max(0, POLL_MS - elapsed);
+    await sleep(wait);
   }
+  console.log("[worker] exit.");
 }
 
-// ---------- Orchestrator ----------
-async function scanOnce() {
-  if (USE_EXPLORER) {
-    return scanOnceExplorer();
-  } else {
-    return scanOnceRpc();
-  }
-}
-
-async function main() {
-  console.log(
-    `Deposit worker running (every ${
-      POLL_MS / 1000
-    }s, min confs=${MIN_CONF}, explorer=${USE_EXPLORER})`
-  );
-  while (true) {
-    try {
-      await scanOnce();
-    } catch (e) {
-      console.error("scanOnce error", e);
-    }
-    await new Promise((r) => setTimeout(r, POLL_MS));
-  }
-}
-
-main().catch((err) => {
-  console.error(err);
+loop().catch((err) => {
+  console.error("worker fatal", err);
   process.exit(1);
 });

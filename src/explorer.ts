@@ -1,35 +1,37 @@
 // src/explorer.ts
-const BASE = process.env.LKY_EXPLORER_BASE ?? "https://luckyscan.org/api";
-const TIMEOUT_MS = Number(process.env.EXPLORER_TIMEOUT_MS ?? "8000");
+// Esplora-compatible helpers with real abortable timeouts.
 
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error("explorer timeout")), ms);
-    p.then(
-      (v) => {
-        clearTimeout(t);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(t);
-        reject(e);
-      }
-    );
-  });
+const BASE = process.env.LKY_EXPLORER_BASE ?? "https://luckyscan.org/api";
+const TIMEOUT_MS = Number(process.env.EXPLORER_TIMEOUT_MS ?? "3000"); // fast default
+
+function abortableFetch(url: string, ms = TIMEOUT_MS): Promise<Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(new Error("explorer_timeout")), ms);
+  // @ts-ignore Node18+ global fetch & AbortController
+  return fetch(url, { signal: ctrl.signal } as any).finally(() =>
+    clearTimeout(t)
+  );
 }
 
 async function getJSON<T>(path: string): Promise<T> {
-  const res = await withTimeout(fetch(BASE + path), TIMEOUT_MS);
+  const res = await abortableFetch(BASE + path);
   if (!res.ok) throw new Error(`Explorer HTTP ${res.status} ${path}`);
-  return res.json() as Promise<T>;
+  return (await res.json()) as T;
 }
+
 async function getText(path: string): Promise<string> {
-  const res = await withTimeout(fetch(BASE + path), TIMEOUT_MS);
+  const res = await abortableFetch(BASE + path);
   if (!res.ok) throw new Error(`Explorer HTTP ${res.status} ${path}`);
   return res.text();
 }
 
-// Minimal types based on Esplora (mempool) API
+// Esplora types
+export type TxVout = { scriptpubkey_address?: string; value: number };
+export type Tx = {
+  txid: string;
+  vout: TxVout[];
+  status: { confirmed: boolean; block_height?: number; block_time?: number };
+};
 export type AddressStats = {
   address: string;
   chain_stats: {
@@ -42,12 +44,6 @@ export type AddressStats = {
     spent_txo_sum: number;
     tx_count: number;
   };
-};
-export type TxVout = { scriptpubkey_address?: string; value: number };
-export type Tx = {
-  txid: string;
-  vout: TxVout[];
-  status: { confirmed: boolean; block_height?: number; block_time?: number };
 };
 
 export async function getTipHeight(): Promise<number> {
