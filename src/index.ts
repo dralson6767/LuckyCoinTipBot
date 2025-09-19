@@ -735,8 +735,18 @@ bot.command("tip", async (ctx) => {
   const kb = needsStart && deepLink ? startKb(deepLink) : undefined;
   const extra: any = { parse_mode: "HTML" };
   if (kb) extra.reply_markup = kb.reply_markup;
-  await safeReply(ctx, lines.join("\n"), extra);
-  deleteAfter(ctx); // delete user's /tip command, keep our public reply
+
+  if (isGroup(ctx)) {
+    // Immediate ack so the chat feels responsive
+    await ephemeralReply(ctx, "✅ Tip placed. Posting…", 2500);
+    deleteAfter(ctx); // delete the user's /tip command
+    // Post the public message via queued sender (handles 429 flood-wait)
+    // @ts-ignore - imported from ./tg
+    const { queueReply } = await import("./tg.js");
+    queueReply(ctx, lines.join("\n"), extra);
+  } else {
+    await safeReply(ctx, lines.join("\n"), extra);
+  }
 
   const dmText = [
     `🎉 You’ve been tipped ${esc(pretty)} LKY by ${esc(fromName)}.`,
