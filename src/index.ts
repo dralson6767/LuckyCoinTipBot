@@ -11,9 +11,32 @@ import { replyFast } from "./tg.js";
 // ---------- bot init ----------
 const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
 const botToken = process.env.BOT_TOKEN;
+const POLL_LIMIT = Number(process.env.TG_POLL_LIMIT ?? "100"); // up to 100 updates per request
+const POLL_TIMEOUT = Number(process.env.TG_POLL_TIMEOUT ?? "30"); // seconds
+const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
+
+const ALLOWED_UPDATES = (
+  process.env.TG_ALLOWED_UPDATES ?? "message,callback_query"
+)
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean) as any; // Telegraf types accept UpdateType[]
+
 if (!botToken) throw new Error("BOT_TOKEN is required");
 const bot = new Telegraf(botToken, { handlerTimeout: 7000 });
 
+// --- measure inbound update latency (Telegram → your bot) ---
+bot.use(async (ctx, next) => {
+  const ts = (ctx.message?.date ??
+    ctx.editedMessage?.date ??
+    ctx.callbackQuery?.message?.date) as number | undefined;
+  if (ts) {
+    const lagSec = Math.max(0, Math.round(Date.now() / 1000 - ts));
+    if (lagSec >= 5)
+      console.warn(`[tg] inbound delay ${lagSec}s type=${ctx.updateType}`);
+  }
+  return next();
+});
 // ---------- perf knobs ----------
 const RESOLVE_USERNAME_TIMEOUT_MS = Number(
   process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
@@ -922,11 +945,23 @@ setInterval(() => {
 }, 10_000);
 
 // Launch with setup
-bot.launch().then(async () => {
-  await ensureSetup();
-  await getBotUsernameEnsured();
-  console.log("Tipbot is running.");
-});
+await bot.telegram
+  .deleteWebhook({ drop_pending_updates: DROP_PENDING })
+  .catch(() => {});
 
+// Start long polling (no 'polling' block in v4, use top-level options)
+bot
+  .launch({
+    dropPendingUpdates: DROP_PENDING,
+    allowedUpdates: ALLOWED_UPDATES,
+  })
+  .then(async () => {
+    await ensureSetup();
+    await getBotUsernameEnsured();
+    console.log("Tipbot is running.");
+  });
+
+process.once("SIGINT", () => bot.stop("SIGINT"));
+process.once("SIGTERM", () => bot.stop("SIGTERM"));
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException", e));
