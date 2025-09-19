@@ -27,8 +27,10 @@ bot.use(async (ctx, next) => {
   }
   return next();
 });
-// ---- drop stale updates to prevent backlog ----
+
+// ---- stale-update guard (warn by default; drop only if TG_DROP_STALE=true) ----
 const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "20");
+const DROP_STALE = String(process.env.TG_DROP_STALE ?? "false") === "true";
 bot.use(async (ctx, next) => {
   const ts = (ctx.message?.date ??
     ctx.editedMessage?.date ??
@@ -39,15 +41,21 @@ bot.use(async (ctx, next) => {
   const ageSec = Math.max(0, Math.round(Date.now() / 1000 - ts));
   if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
     const txt = (ctx.message as any)?.text || "";
-    console.warn(
-      `[tg] DROPPED stale update ${ageSec}s type=${ctx.updateType} ${
-        txt ? `"${txt.slice(0, 40)}"` : ""
-      }`
-    );
-    return; // don't process this old update
+    const info = txt ? ` "${txt.slice(0, 40)}"` : "";
+    if (DROP_STALE) {
+      console.warn(
+        `[tg] DROPPED stale update ${ageSec}s type=${ctx.updateType}${info}`
+      );
+      return;
+    } else {
+      console.warn(
+        `[tg] stale update ${ageSec}s (processing anyway) type=${ctx.updateType}${info}`
+      );
+    }
   }
   return next();
 });
+
 // ---------- perf knobs ----------
 const RESOLVE_USERNAME_TIMEOUT_MS = Number(
   process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
@@ -564,7 +572,7 @@ bot.command("deposit", async (ctx) => {
     );
     depositAddrCache.set(user.id, { addr, ts: Date.now() });
     await replyAddr(addr);
-    console.log("[/deposit] assigned");
+    console.log("[/deposit] assigned]");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
     const mention = await botMention(ctx);
