@@ -11,16 +11,6 @@ import { replyFast } from "./tg.js";
 // ---------- bot init ----------
 const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
 const botToken = process.env.BOT_TOKEN;
-const POLL_LIMIT = Number(process.env.TG_POLL_LIMIT ?? "100"); // up to 100 updates per request
-const POLL_TIMEOUT = Number(process.env.TG_POLL_TIMEOUT ?? "30"); // seconds
-const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
-
-const ALLOWED_UPDATES = (
-  process.env.TG_ALLOWED_UPDATES ?? "message,callback_query"
-)
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean) as any; // Telegraf types accept UpdateType[]
 
 if (!botToken) throw new Error("BOT_TOKEN is required");
 const bot = new Telegraf(botToken, { handlerTimeout: 7000 });
@@ -34,6 +24,27 @@ bot.use(async (ctx, next) => {
     const lagSec = Math.max(0, Math.round(Date.now() / 1000 - ts));
     if (lagSec >= 5)
       console.warn(`[tg] inbound delay ${lagSec}s type=${ctx.updateType}`);
+  }
+  return next();
+});
+// ---- drop stale updates to prevent backlog ----
+const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "20");
+bot.use(async (ctx, next) => {
+  const ts = (ctx.message?.date ??
+    ctx.editedMessage?.date ??
+    ctx.callbackQuery?.message?.date) as number | undefined;
+
+  if (!ts) return next();
+
+  const ageSec = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
+    const txt = (ctx.message as any)?.text || "";
+    console.warn(
+      `[tg] DROPPED stale update ${ageSec}s type=${ctx.updateType} ${
+        txt ? `"${txt.slice(0, 40)}"` : ""
+      }`
+    );
+    return; // don't process this old update
   }
   return next();
 });
@@ -944,24 +955,39 @@ setInterval(() => {
   loopLag.reset();
 }, 10_000);
 
-// Launch with setup
-await bot.telegram
-  .deleteWebhook({ drop_pending_updates: DROP_PENDING })
-  .catch(() => {});
+// Launch (no top-level await!)
+const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
+const ALLOWED_UPDATES = (process.env.TG_ALLOWED_UPDATES ?? "message")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean) as any;
 
-// Start long polling (no 'polling' block in v4, use top-level options)
-bot
-  .launch({
+async function start() {
+  try {
+    // ensure long polling (disable webhook) and optionally drop backlog
+    await bot.telegram.deleteWebhook({ drop_pending_updates: DROP_PENDING });
+  } catch (e: any) {
+    console.warn("[launch] deleteWebhook warn:", e?.message || e);
+  }
+
+  await bot.launch({
     dropPendingUpdates: DROP_PENDING,
     allowedUpdates: ALLOWED_UPDATES,
-  })
-  .then(async () => {
-    await ensureSetup();
-    await getBotUsernameEnsured();
-    console.log("Tipbot is running.");
   });
 
-process.once("SIGINT", () => bot.stop("SIGINT"));
-process.once("SIGTERM", () => bot.stop("SIGTERM"));
+  await ensureSetup();
+  await getBotUsernameEnsured();
+  console.log("Tipbot is running.");
+
+  // graceful shutdown
+  process.once("SIGINT", () => bot.stop("SIGINT"));
+  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+}
+
+start().catch((e) => {
+  console.error("[launch] fatal:", e?.message || e);
+  process.exit(1);
+});
+
 process.on("unhandledRejection", (e) => console.error("unhandledRejection", e));
 process.on("uncaughtException", (e) => console.error("uncaughtException", e));
