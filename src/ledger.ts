@@ -9,12 +9,12 @@ import {
 /**
  * Ledger + Users helpers with compacted tip logic.
  *
- * Balances are computed as:
- *   balance_lites = users.transferred_tip_lites
- *                 + SUM(ledger.delta_lites WHERE reason IN ('deposit','withdrawal'))
+ * balance_lites =
+ *   users.transferred_tip_lites
+ *   + SUM(ledger.delta_lites WHERE reason IN ('deposit','withdrawal'))
  *
- * Tip operations (transfer) update `users.transferred_tip_lites` directly,
- * and we still write paired tip rows to `ledger` for audit (not used for balance).
+ * Tips update users.transferred_tip_lites (authoritative) and still
+ * write paired audit rows in ledger (tip_out / tip_in).
  */
 
 // -----------------------------------------------------------------------------
@@ -84,29 +84,6 @@ export async function ensureUser(tg: TgLike): Promise<DbUser> {
   return res.rows[0];
 }
 
-// -----------------------------------------------------------------------------
-// Balance (compacted)
-// -----------------------------------------------------------------------------
-
-/**
- * Return the user's balance in lites as BigInt using compacted logic:
- *   users.transferred_tip_lites + SUM(ledger for deposit/withdrawal)
- */
-export async function balanceLites(userId: number): Promise<bigint> {
-  const r = await query<{ s: string }>(
-    `SELECT (
-        u.transferred_tip_lites
-        + COALESCE(SUM(CASE WHEN l.reason IN ('deposit','withdrawal') THEN l.delta_lites ELSE 0 END), 0)
-      )::text AS s
-       FROM public.users u
-       LEFT JOIN public.ledger l ON l.user_id = u.id
-      WHERE u.id = $1
-      GROUP BY u.id, u.transferred_tip_lites`,
-    [userId]
-  );
-  return BigInt(r.rows[0]?.s ?? "0");
-}
-
 /** Find a user by @username (case-insensitive). */
 export async function findUserByUsername(
   username: string
@@ -125,7 +102,26 @@ export async function findUserByUsername(
 }
 
 // -----------------------------------------------------------------------------
-// Ledger insert helpers (client-safe variants + pool wrappers)
+// Balance (compacted read)
+// -----------------------------------------------------------------------------
+
+export async function balanceLites(userId: number): Promise<bigint> {
+  const r = await query<{ s: string }>(
+    `SELECT (
+        u.transferred_tip_lites
+        + COALESCE(SUM(CASE WHEN l.reason IN ('deposit','withdrawal') THEN l.delta_lites ELSE 0 END), 0)
+      )::text AS s
+       FROM public.users u
+       LEFT JOIN public.ledger l ON l.user_id = u.id
+      WHERE u.id = $1
+      GROUP BY u.id, u.transferred_tip_lites`,
+    [userId]
+  );
+  return BigInt(r.rows[0]?.s ?? "0");
+}
+
+// -----------------------------------------------------------------------------
+// Ledger helpers (client-safe variants + pool wrappers)
 // -----------------------------------------------------------------------------
 
 /** Internal: find an existing ledger row id by (reason, ref) using a specific client. */
@@ -246,7 +242,7 @@ export async function debitWithClient(
   return insertLedgerWithClient(c, userId, -amt, reason, ref, at);
 }
 
-/** DEBIT pool wrapper (kept for existing callers like /withdraw). */
+/** DEBIT pool wrapper. */
 export async function debit(
   userId: number,
   amountLites: bigint | number | string,
@@ -260,11 +256,12 @@ export async function debit(
 }
 
 // -----------------------------------------------------------------------------
-// Transfers (tips) — fully transaction-safe on ONE client
+// Transfers (tips) — transaction-safe on ONE client
 // -----------------------------------------------------------------------------
 
 /**
  * Tip transfer between users, fully atomic:
+ * - Locks sender row to serialize concurrent tips (prevents double-spend)
  * - Validates balance on the same connection
  * - Writes ledger audit rows (idempotent) on the same connection
  * - Updates users.transferred_tip_lites for both users
@@ -284,14 +281,19 @@ export async function transfer(
   await withClient(async (c) => {
     await c.query("BEGIN");
     try {
-      // 1) Balance check on THIS connection
+      // 0) Serialize concurrent spenders: lock sender row
+      await c.query(`SELECT id FROM public.users WHERE id = $1 FOR UPDATE`, [
+        fromUserId,
+      ]);
+
+      // 1) Balance check on THIS connection (reads deposits/withdrawals too)
       const bal = await getBalanceLitesWithClient(c, fromUserId);
       if (bal < amountLites) {
         await c.query("ROLLBACK");
         throw new Error("Insufficient balance");
       }
 
-      // 2) Optional audit rows
+      // 2) Audit rows (idempotent)
       let outId = await insertLedgerWithClient(
         c,
         fromUserId,
@@ -308,20 +310,22 @@ export async function transfer(
         ref,
         now
       );
-
-      // If concurrent insert raced, fetch existing IDs by (reason, ref)
       if (outId === null)
         outId = await findLedgerIdByRefWithClient(c, "tip_out", ref);
       if (inId === null)
         inId = await findLedgerIdByRefWithClient(c, "tip_in", ref);
 
-      // 3) Update compacted totals on users (authoritative for balances)
+      // 3) Apply authoritative totals
       await c.query(
-        `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites - $1 WHERE id = $2`,
+        `UPDATE public.users
+           SET transferred_tip_lites = transferred_tip_lites - $1
+         WHERE id = $2`,
         [amountLites.toString(), fromUserId]
       );
       await c.query(
-        `UPDATE public.users SET transferred_tip_lites = transferred_tip_lites + $1 WHERE id = $2`,
+        `UPDATE public.users
+           SET transferred_tip_lites = transferred_tip_lites + $1
+         WHERE id = $2`,
         [amountLites.toString(), toUserId]
       );
 

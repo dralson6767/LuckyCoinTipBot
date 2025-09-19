@@ -16,6 +16,7 @@ export async function replyFast(
   timeoutMs = Number(process.env.TG_REPLY_TIMEOUT_MS ?? "5000")
 ) {
   try {
+    // @ts-ignore (Context.reply is Promise-like)
     return await Promise.race([
       ctx.reply(text, extra as any),
       timeout(timeoutMs),
@@ -38,7 +39,7 @@ let running = false;
 
 const SPACING_MS = Number(process.env.TG_SEND_SPACING_MS ?? "250"); // gap between sends
 
-async function sleep(ms: number) {
+function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
@@ -55,12 +56,10 @@ async function runQueue() {
         if (retry) {
           console.warn(`[tg] flood-wait ${retry}s; rescheduling`);
           await sleep((retry + 1) * 1000);
-          // re-queue at the front so it goes next
           queue.unshift(job);
           continue;
-        } else {
-          console.warn("[tg] send error:", e?.message || e);
         }
+        console.warn("[tg] send error:", e?.message || e);
       }
       await sleep(SPACING_MS);
     }
