@@ -962,6 +962,24 @@ const ALLOWED_UPDATES = (process.env.TG_ALLOWED_UPDATES ?? "message")
   .map((s) => s.trim())
   .filter(Boolean) as any;
 
+// ---- polling watchdog: exit if no updates for too long ----
+let lastUpdateMs = Date.now();
+bot.use(async (ctx, next) => {
+  lastUpdateMs = Date.now();
+  return next();
+});
+
+const WATCHDOG_IDLE_SEC = Number(process.env.WATCHDOG_IDLE_SEC ?? "120");
+setInterval(() => {
+  const idleSec = Math.floor((Date.now() - lastUpdateMs) / 1000);
+  if (idleSec > WATCHDOG_IDLE_SEC) {
+    console.error(
+      `[watchdog] no updates for ${idleSec}s — exiting for restart`
+    );
+    process.exit(86); // Docker will restart us
+  }
+}, 30_000);
+
 async function start() {
   try {
     // ensure long polling (disable webhook) and optionally drop backlog
