@@ -3,12 +3,13 @@ import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { rpc } from "./rpc.js";
-import { query } from "./db.js";
+import { query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
+import { replyFast } from "./tg.js";
 
 // ---------- bot init ----------
-const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "3500"); // hard cap per Telegram call
+const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 const bot = new Telegraf(botToken, { handlerTimeout: 7000 });
@@ -56,7 +57,7 @@ async function ensureUserCached(tg: any) {
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
-// basic timeout wrapper
+// basic timeout wrapper (for RPC helpers below)
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
@@ -73,26 +74,12 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// timing logs (to see where lag is)
-async function timed<T>(label: string, fn: () => Promise<T>): Promise<T> {
-  const t0 = Date.now();
-  try {
-    const res = await fn();
-    console.log(`[timing] ${label} ${Date.now() - t0}ms`);
-    return res;
-  } catch (e) {
-    console.log(`[timing] ${label} ${Date.now() - t0}ms (ERR)`);
-    throw e;
-  }
-}
-
 // ---- Telegram send gate (prevents bursts from piling up) ----
 let tgInflight = 0;
 const tgWaiters: Array<() => void> = [];
 async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
-  if (tgInflight >= MAX_TG_INFLIGHT) {
+  if (tgInflight >= MAX_TG_INFLIGHT)
     await new Promise<void>((res) => tgWaiters.push(res));
-  }
   tgInflight++;
   try {
     return await fn();
@@ -103,7 +90,10 @@ async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-// safe wrappers for Telegram API calls (always time out)
+// safe wrappers for Telegram API calls (always time out / never hang the handler)
+async function safeReply(ctx: any, text: string, extra: any = {}) {
+  return withTgGate(() => replyFast(ctx, text, extra, TG_API_TIMEOUT_MS));
+}
 async function safeSend(
   ctx: any,
   chatId: number,
@@ -119,16 +109,6 @@ async function safeSend(
 }
 
 type SentMessage = { message_id: number };
-
-async function safeReply(
-  ctx: any,
-  text: string,
-  extra: any = {}
-): Promise<SentMessage> {
-  return withTgGate(() =>
-    withTimeout(ctx.reply(text, extra), TG_API_TIMEOUT_MS)
-  ) as Promise<SentMessage>;
-}
 
 async function safeGetMe() {
   return withTimeout(bot.telegram.getMe(), TG_API_TIMEOUT_MS);
@@ -153,7 +133,7 @@ const ephemeralReply = async (
   extra: any = {}
 ) => {
   try {
-    const m = (await safeReply(ctx, text, extra)) as { message_id?: number };
+    const m = (await safeReply(ctx, text, extra)) as SentMessage | undefined;
     if (isGroup(ctx) && m?.message_id) {
       setTimeout(() => {
         ctx.deleteMessage(m.message_id!).catch(() => {});
@@ -242,7 +222,6 @@ const startKb = (url?: string) =>
 
 // ---------- RPC helpers ----------
 type RpcErr = { code?: number; message?: string };
-
 const isWalletBusy = (e: any) => {
   const msg = String(e?.message || e || "");
   return (
@@ -253,7 +232,6 @@ const isWalletBusy = (e: any) => {
     e?.code === -28
   );
 };
-
 async function rpcTry<T>(
   method: string,
   params: any[],
@@ -271,9 +249,8 @@ async function rpcTry<T>(
 let rpcInflight = 0;
 const rpcWaiters: Array<() => void> = [];
 async function withRpcGate<T>(fn: () => Promise<T>): Promise<T> {
-  if (rpcInflight >= MAX_RPC_INFLIGHT) {
+  if (rpcInflight >= MAX_RPC_INFLIGHT)
     await new Promise<void>((res) => rpcWaiters.push(res));
-  }
   rpcInflight++;
   try {
     return await fn();
@@ -292,51 +269,21 @@ async function ensureSetup() {
   await query(
     `CREATE INDEX IF NOT EXISTS idx_users_has_started ON public.users(has_started);`
   );
-
-  // balance speed indexes
+  // balance speed indexes (help the planner on the common predicates)
   await query(
     `CREATE INDEX IF NOT EXISTS idx_ledger_user_reason ON public.ledger(user_id, reason);`
   ).catch(() => {});
-  try {
-    await query(
-      `CREATE INDEX IF NOT EXISTS idx_ledger_bal_fast
-         ON public.ledger(user_id) INCLUDE (delta_lites)
-       WHERE reason IN ('deposit','withdrawal');`
-    );
-  } catch {
-    await query(
-      `CREATE INDEX IF NOT EXISTS idx_ledger_bal_fast_fb
-         ON public.ledger(user_id, reason, delta_lites)
-       WHERE reason IN ('deposit','withdrawal');`
-    );
-  }
-  await query(`ANALYZE public.ledger;`).catch(() => {});
-}
-
-// ---------- FAST BALANCE (rollup table) ----------
-async function getBalanceLitesFast(userId: number): Promise<bigint> {
-  const sql = `
-    SELECT
-      u.transferred_tip_lites
-      + COALESCE(r.dw_sum_lites, 0) AS balance_lites
-    FROM public.users u
-    LEFT JOIN public.ledger_dw_rollup r
-      ON r.user_id = u.id
-    WHERE u.id = $1
-    LIMIT 1;
-  `;
-  const r = await query<{ balance_lites: string }>(sql, [userId]);
-  const v = r.rows[0]?.balance_lites ?? "0";
-  return BigInt(v);
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_ledger_user ON public.ledger(user_id);`
+  ).catch(() => {});
 }
 
 // ===== Small balance cache (instant /balance + write-through updates) =====
 const balanceCache = new Map<number, { bal: bigint; ts: number }>();
-
 async function getBalanceCached(userId: number): Promise<bigint> {
   const hit = balanceCache.get(userId);
   if (hit && Date.now() - hit.ts < BAL_CACHE_MS) return hit.bal;
-  const bal = await getBalanceLitesFast(userId);
+  const bal = await getBalanceLites(userId); // uses db.ts aggregate over ledger
   balanceCache.set(userId, { bal, ts: Date.now() });
   return bal;
 }
@@ -501,7 +448,7 @@ bot.help(async (ctx) => {
         link ? `Please DM me first: ${mention}` : "Please DM me first.",
         6000
       );
-    deleteAfter(ctx); // <- delete the user's /help command in groups
+    deleteAfter(ctx);
   } else {
     await safeReply(ctx, text, { parse_mode: "Markdown" });
   }
@@ -533,14 +480,14 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
       return id;
     }
   } catch {
-    // timeout or error
+    /* timeout or error */
   }
   return null;
 }
 
-// ===== /deposit (instant reply + cache; DM in background) =====
+// ===== /deposit =====
 const depositAddrCache = new Map<number, { addr: string; ts: number }>();
-const CACHE_MS = 10 * 60 * 1000; // 10 minutes
+const DEP_CACHE_MS = 10 * 60 * 1000; // 10 minutes
 
 bot.command("deposit", async (ctx) => {
   console.log("[/deposit] start", ctx.from?.id, ctx.chat?.id);
@@ -551,7 +498,7 @@ bot.command("deposit", async (ctx) => {
     if (isGroup(ctx)) {
       await ephemeralReply(ctx, msg, 12000, { parse_mode: "Markdown" });
       dmLater(ctx, ctx.from.id, msg, { parse_mode: "Markdown" });
-      deleteAfter(ctx); // <- delete the user's /deposit command in groups
+      deleteAfter(ctx);
     } else {
       await safeReply(ctx, msg, { parse_mode: "Markdown" });
     }
@@ -559,7 +506,7 @@ bot.command("deposit", async (ctx) => {
 
   try {
     const hit = depositAddrCache.get(user.id);
-    if (hit && Date.now() - hit.ts < CACHE_MS) {
+    if (hit && Date.now() - hit.ts < DEP_CACHE_MS) {
       await replyAddr(hit.addr);
       console.log("[/deposit] cache hit");
       return;
@@ -599,14 +546,14 @@ bot.command("deposit", async (ctx) => {
           link ? `Please DM me first: ${mention}` : "Please DM me first.",
           6000
         );
-      deleteAfter(ctx); // <- delete the user's /deposit command even on errors
+      deleteAfter(ctx);
     } else {
       await safeReply(ctx, msg);
     }
   }
 });
 
-// ----- /balance ----- (compact + fast)
+// ----- /balance -----
 bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
@@ -624,7 +571,7 @@ bot.command("balance", async (ctx) => {
           6000
         );
       }
-      deleteAfter(ctx); // <- delete the user's /balance command in groups
+      deleteAfter(ctx);
     } else {
       await safeReply(ctx, text);
     }
@@ -636,11 +583,11 @@ bot.command("balance", async (ctx) => {
       "Balance temporarily unavailable, try again shortly.",
       6000
     );
-    if (isGroup(ctx)) deleteAfter(ctx); // <- also delete on errors
+    if (isGroup(ctx)) deleteAfter(ctx);
   }
 });
 
-// ----- /tip ----- (optimized; fast username resolve)
+// ----- /tip -----
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
@@ -655,7 +602,6 @@ bot.command("tip", async (ctx) => {
       ? ctx.message!.reply_to_message?.from
       : undefined;
 
-  // amount (last token)
   const amountStr = parts[parts.length - 1];
   if (!amountStr) {
     await ephemeralReply(
@@ -679,7 +625,6 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // resolve recipient (fast path for reply, otherwise cached username resolve)
   let targetUserId: number | null = null;
   let unameFromCmd: string | null = null;
 
@@ -722,7 +667,6 @@ bot.command("tip", async (ctx) => {
     return;
   }
 
-  // ensure recipient exists (if not from replyTo branch)
   const to = replyTo
     ? await ensureUserCached(replyTo)
     : await ensureUserCached({
@@ -730,7 +674,6 @@ bot.command("tip", async (ctx) => {
         username: unameFromCmd?.replace(/^@/, "") || undefined,
       });
 
-  // --- perform transfer & fetch has_started in parallel ---
   let needsStart = false;
   try {
     const xferP = transfer(from.id, to.id, amount);
@@ -738,7 +681,6 @@ bot.command("tip", async (ctx) => {
       "SELECT has_started FROM public.users WHERE id = $1",
       [to.id]
     );
-
     const [xferRes, startedRes] = await Promise.allSettled([xferP, startedP]);
 
     if (xferRes.status === "rejected") {
@@ -748,7 +690,7 @@ bot.command("tip", async (ctx) => {
       return;
     }
 
-    // write-through: keep cached balances hot
+    // write-through cache
     adjustBalanceCache(from.id, -amount);
     adjustBalanceCache(to.id, amount);
 
@@ -809,7 +751,7 @@ bot.command("tip", async (ctx) => {
   console.log("[/tip] ok (non-blocking DM)");
 });
 
-// ----- /withdraw -----  (instant ack + background RPC)
+// ----- /withdraw -----
 bot.command("withdraw", async (ctx) => {
   console.log("[/withdraw] start");
   const sender = await ensureUserCached(ctx.from);
@@ -830,7 +772,7 @@ bot.command("withdraw", async (ctx) => {
           link ? `Please DM me first: ${mention}` : "Please DM me first.",
           6000
         );
-      deleteAfter(ctx); // <- delete command
+      deleteAfter(ctx);
     } else {
       await safeReply(ctx, msg);
     }
@@ -885,7 +827,7 @@ bot.command("withdraw", async (ctx) => {
   const ack = `Processing your withdrawal...\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nI'll DM you the result.`;
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, ack, 6000, { parse_mode: "Markdown" });
-    deleteAfter(ctx); // <- delete command once acknowledged
+    deleteAfter(ctx);
   } else {
     await safeReply(ctx, ack, { parse_mode: "Markdown" });
   }
@@ -893,17 +835,15 @@ bot.command("withdraw", async (ctx) => {
   // background work
   (async () => {
     try {
-      const v = await timed("validateaddress", () =>
+      const v = await withRpcGate(() =>
         rpcTry<any>("validateaddress", [toAddress], 5000)
       );
       if (v.ok && v.value && v.value.isvalid === false) {
         return dmLater(ctx, ctx.from.id, "Invalid address.");
       }
 
-      const send = await timed("sendtoaddress", () =>
-        withRpcGate(() =>
-          rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
-        )
+      const send = await withRpcGate(() =>
+        rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
       );
 
       if (!send.ok) {
@@ -923,34 +863,28 @@ bot.command("withdraw", async (ctx) => {
 
       const txid = send.value;
 
-      await timed("record-withdrawal", async () => {
-        try {
-          await query(
-            `INSERT INTO public.withdrawals (user_id, to_address, amount_lites, txid, status, created_at)
-             VALUES ($1,$2,$3,$4,'sent', NOW())
-             ON CONFLICT (txid) DO NOTHING`,
-            [sender.id, toAddress, amount.toString(), txid]
-          );
-        } catch (e: any) {
-          console.error(
-            "[/withdraw bg] insert withdrawals ERR:",
-            e?.message || e
-          );
-        }
+      try {
+        await query(
+          `INSERT INTO public.withdrawals (user_id, to_address, amount_lites, txid, status, created_at)
+           VALUES ($1,$2,$3,$4,'sent', NOW())
+           ON CONFLICT (txid) DO NOTHING`,
+          [sender.id, toAddress, amount.toString(), txid]
+        );
+      } catch (e: any) {
+        console.error(
+          "[/withdraw bg] insert withdrawals ERR:",
+          e?.message || e
+        );
+      }
 
-        try {
-          await debit(sender.id, amount, "withdrawal", txid);
-          adjustBalanceCache(sender.id, -amount);
-        } catch (e: any) {
-          console.error("[/withdraw bg] debit ledger ERR:", e?.message || e);
-        }
-      });
+      try {
+        await debit(sender.id, amount, "withdrawal", txid);
+        adjustBalanceCache(sender.id, -amount);
+      } catch (e: any) {
+        console.error("[/withdraw bg] debit ledger ERR:", e?.message || e);
+      }
 
-      const okMsg =
-        `Withdrawal sent.\n` +
-        `Amount: ${amtStr} LKY\n` +
-        `Address: \`${toAddress}\`\n` +
-        `TXID: \`${txid}\``;
+      const okMsg = `Withdrawal sent.\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nTXID: \`${txid}\``;
       dmLater(ctx, ctx.from.id, okMsg, { parse_mode: "Markdown" });
       console.log("[/withdraw bg] ok", txid);
     } catch (e: any) {
@@ -967,15 +901,17 @@ bot.command("withdraw", async (ctx) => {
 // ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
-// Event-loop lag monitor: prints if the loop is congested
+// Event-loop lag monitor: print in **ms** (convert from ns)
 const loopLag = monitorEventLoopDelay({ resolution: 20 });
 loopLag.enable();
 setInterval(() => {
-  const p95 = Math.round(loopLag.percentile(95));
-  if (p95 > 200) console.warn(`[health] event-loop p95 lag=${p95}ms`);
+  const p95ms = Number(loopLag.percentile(95)) / 1e6; // ns → ms
+  if (p95ms > 20)
+    console.warn(`[health] event-loop p95 lag=${p95ms.toFixed(2)}ms`);
+  loopLag.reset();
 }, 10_000);
 
-// Launch with tighter polling
+// Launch with setup
 bot.launch().then(async () => {
   await ensureSetup();
   await getBotUsernameEnsured();
