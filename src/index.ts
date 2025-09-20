@@ -7,41 +7,17 @@ import pool, { query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 import { replyFast } from "./tg.js";
-import { getQueueStats } from "./tg.js";
 
 // ---------- bot init ----------
-const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000");
+const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 
-// give handlers some headroom
+// Slightly looser than 7s to avoid handler timeouts on brief hiccups.
 const bot = new Telegraf(botToken, { handlerTimeout: 15000 });
 
-// ---------- perf / knobs ----------
-const RESOLVE_USERNAME_TIMEOUT_MS = Number(
-  process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
-);
-const USERNAME_CACHE_MS = Number(process.env.USERNAME_CACHE_MS ?? "1200000");
-const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000");
-const ENSURE_USER_CACHE_MS = Number(
-  process.env.ENSURE_USER_CACHE_MS ?? "300000"
-);
-const MAX_RPC_INFLIGHT = Number(process.env.MAX_RPC_INFLIGHT ?? "4");
-const MAX_TG_INFLIGHT = Number(process.env.MAX_TG_INFLIGHT ?? "8");
-const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
-const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "0"); // 0 = disabled
-const DEBUG_UPDATES = process.env.DEBUG_UPDATES === "1";
-const DEBUG_POLL = process.env.DEBUG_POLL === "1";
-
-// ---- watchdog (update first!) ----
-let lastUpdateMs = Date.now();
-bot.use(async (_ctx, next) => {
-  lastUpdateMs = Date.now(); // always update, even if a later middleware decides to drop
-  return next();
-});
-
-// minimal inbound visibility
-if (DEBUG_UPDATES) {
+// Optional minimal visibility
+if (process.env.DEBUG_UPDATES === "1") {
   bot.use((ctx, next) => {
     console.log(
       `[tg] <- ${ctx.updateType} chat=${(ctx.chat as any)?.id ?? "?"}`
@@ -50,7 +26,7 @@ if (DEBUG_UPDATES) {
   });
 }
 
-// inbound lag meter (for visibility only)
+// --- inbound update latency (Telegram → your bot) ---
 bot.use(async (ctx, next) => {
   const ts = (ctx.message?.date ??
     ctx.editedMessage?.date ??
@@ -63,71 +39,52 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ---- drop stale updates (SAFE: lastUpdateMs already bumped above) ----
-if (STALE_UPDATE_MAX_AGE_SEC > 0) {
-  bot.use(async (ctx, next) => {
-    const ts = (ctx.message?.date ??
-      ctx.editedMessage?.date ??
-      ctx.callbackQuery?.message?.date) as number | undefined;
-    if (!ts) return next();
-    const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
-    if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
-      const txt = (ctx.message as any)?.text || "";
-      console.warn(
-        `[tg] DROP stale age=${ageSec}s type=${ctx.updateType} ${
-          txt ? `"${txt.slice(0, 40)}"` : ""
-        }`
-      );
-      return; // safe to drop: watchdog already saw this update
-    }
-    return next();
-  });
-}
-
-// ---- optional: poll round tracing (off unless DEBUG_POLL=1) ----
-if (DEBUG_POLL) {
-  const orig = (bot.telegram as any).callApi?.bind(bot.telegram);
-  if (orig) {
-    (bot.telegram as any).callApi = async (
-      method: string,
-      data?: any,
-      ...rest: any[]
-    ) => {
-      if (method === "getUpdates") {
-        const off = data?.offset ?? "n/a";
-        const to = data?.timeout ?? "n/a";
-        console.log(`[poll] getUpdates → offset=${off} timeout=${to}`);
-      }
-      try {
-        const res = await orig(method, data, ...rest);
-        if (method === "getUpdates") {
-          console.log(
-            `[poll] ✓ got ${Array.isArray(res) ? res.length : 0} updates`
-          );
-        }
-        return res;
-      } catch (e: any) {
-        if (method === "getUpdates")
-          console.warn(`[poll] ✗ getUpdates error: ${e?.message || e}`);
-        throw e;
-      }
-    };
+// ---- drop stale updates (OFF by default; enable with TG_STALE_SEC>0) ----
+const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "0");
+bot.use(async (ctx, next) => {
+  if (!STALE_UPDATE_MAX_AGE_SEC) return next();
+  const ts = (ctx.message?.date ??
+    ctx.editedMessage?.date ??
+    ctx.callbackQuery?.message?.date) as number | undefined;
+  if (!ts) return next();
+  const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
+    console.warn(`[tg] DROP update type=${ctx.updateType} age=${ageSec}s`);
+    return;
   }
-}
+  return next();
+});
 
-// tiny cache for @username → tg id
+// ---------- perf knobs ----------
+const RESOLVE_USERNAME_TIMEOUT_MS = Number(
+  process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
+);
+const USERNAME_CACHE_MS = Number(process.env.USERNAME_CACHE_MS ?? "1200000"); // 20 min
+const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
+const ENSURE_USER_CACHE_MS = Number(
+  process.env.ENSURE_USER_CACHE_MS ?? "300000"
+); // 5 min
+const MAX_RPC_INFLIGHT = Number(process.env.MAX_RPC_INFLIGHT ?? "4");
+const MAX_TG_INFLIGHT = Number(process.env.MAX_TG_INFLIGHT ?? "8");
+const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
+
+// ---------- hot-path caches ----------
 type CacheHit = { id: number; ts: number };
+
+// @username -> tg id memo (resolved from DB or getChat)
 const unameCache = new Map<string, CacheHit>();
 
-// --- ensureUser cache ---
+// cache for ensureUser (avoid hammering DB every message)
 const ensureUserCache = new Map<
   number,
   { id: number; uname?: string; ts: number }
 >();
-async function ensureUserCached(tg: any) {
+async function ensureUserCached(tg: { id?: number; username?: string | null }) {
   const id = Number(tg?.id);
-  const uname = tg?.username || undefined;
+  if (!id) throw new Error("Bad tg user id");
+  const uname = (tg?.username ?? undefined) as string | undefined;
   const now = Date.now();
+
   const hit = ensureUserCache.get(id);
   if (
     hit &&
@@ -136,7 +93,8 @@ async function ensureUserCached(tg: any) {
   ) {
     return { id: hit.id };
   }
-  const u = await ensureUser(tg);
+
+  const u = await ensureUser({ id, username: uname ?? null } as any);
   ensureUserCache.set(id, { id: u.id, uname, ts: now });
   return u;
 }
@@ -168,14 +126,18 @@ async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
   if (tgInflight >= MAX_TG_INFLIGHT)
     await new Promise<void>((res) => tgWaiters.push(res));
   tgInflight++;
+  (globalThis as any).tgInflight = tgInflight;
   try {
     return await fn();
   } finally {
     tgInflight--;
-    tgWaiters.shift()?.();
+    (globalThis as any).tgInflight = tgInflight;
+    const n = tgWaiters.shift();
+    if (n) n();
   }
 }
 
+// safe wrappers
 async function safeReply(ctx: any, text: string, extra: any = {}) {
   return withTgGate(() => replyFast(ctx, text, extra, TG_API_TIMEOUT_MS));
 }
@@ -218,8 +180,11 @@ const ephemeralReply = async (
 ) => {
   try {
     const m = (await safeReply(ctx, text, extra)) as SentMessage | undefined;
-    if (isGroup(ctx) && m?.message_id)
-      setTimeout(() => ctx.deleteMessage(m.message_id!).catch(() => {}), ms);
+    if (isGroup(ctx) && m?.message_id) {
+      setTimeout(() => {
+        ctx.deleteMessage(m.message_id!).catch(() => {});
+      }, ms);
+    }
   } catch {}
 };
 
@@ -330,7 +295,8 @@ async function withRpcGate<T>(fn: () => Promise<T>): Promise<T> {
     return await fn();
   } finally {
     rpcInflight--;
-    rpcWaiters.shift()?.();
+    const next = rpcWaiters.shift();
+    if (next) next();
   }
 }
 
@@ -364,7 +330,7 @@ function adjustBalanceCache(userId: number, delta: bigint) {
   if (h) balanceCache.set(userId, { bal: h.bal + delta, ts: Date.now() });
 }
 
-// ---------- deposit address ----------
+// ---------- deposit address (reuse) ----------
 async function getOrAssignDepositAddress(
   userId: number,
   tgUserId: number
@@ -430,26 +396,33 @@ bot.command("health", async (ctx) => {
 
 // ---------- diag ----------
 bot.command("diag", async (ctx) => {
+  // event-loop p95 (ms) since last reset
   let p95ms = 0;
   try {
     p95ms = Number((globalThis as any).__loopLag?.percentile?.(95) ?? 0) / 1e6;
   } catch {}
+
+  // tg queued sender stats (optional)
   let tgQ = { size: 0, running: false };
   try {
-    tgQ = getQueueStats();
+    const { getQueueStats } = await import("./tg.js"); // lazy
+    tgQ = typeof getQueueStats === "function" ? getQueueStats() : tgQ;
   } catch {}
+
+  const m = process.memoryUsage();
   const lines = [
     `uptime: ${Math.floor(process.uptime())}s`,
     `eventLoop p95: ${p95ms.toFixed(2)}ms`,
+    `tgInflight: ${(globalThis as any).tgInflight ?? "n/a"}`,
     `tgQueue: size=${tgQ.size} running=${tgQ.running}`,
     `pgPool: total=${(pool as any).totalCount} idle=${
       (pool as any).idleCount
     } waiting=${(pool as any).waitingCount}`,
-    `mem: rss=${(process.memoryUsage().rss / 1024 / 1024).toFixed(
-      1
-    )}MB heapUsed=${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(
-      1
-    )}MB`,
+    `mem: rss=${(m.rss / 1024 / 1024).toFixed(1)}MB heapUsed=${(
+      m.heapUsed /
+      1024 /
+      1024
+    ).toFixed(1)}MB`,
     `env: MAX_TG_INFLIGHT=${process.env.MAX_TG_INFLIGHT ?? "n/a"} PG_POOL_MAX=${
       process.env.PG_POOL_MAX ?? "n/a"
     }`,
@@ -576,7 +549,9 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
       unameCache.set(key, { id, ts: Date.now() });
       return id;
     }
-  } catch {}
+  } catch {
+    /* timeout or error */
+  }
   return null;
 }
 
@@ -625,7 +600,7 @@ bot.command("deposit", async (ctx) => {
     );
     depositAddrCache.set(user.id, { addr, ts: Date.now() });
     await replyAddr(addr);
-    console.log("[/deposit] assigned]");
+    console.log("[/deposit] assigned");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
     const mention = await botMention(ctx);
@@ -685,6 +660,7 @@ bot.command("balance", async (ctx) => {
 // ----- /tip -----
 bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
+
   const from = await ensureUserCached(ctx.from);
 
   const text = ctx.message?.text || "";
@@ -820,7 +796,8 @@ bot.command("tip", async (ctx) => {
   ];
   if (needsStart) {
     lines.push(
-      `👉 Credit is reserved. Press <b>START LKY TIPBOT</b> to activate your wallet and auto-claim.\nAfter opening the chat, tap the big <b>Start</b> button.`
+      `👉 Credit is reserved. Press <b>START LKY TIPBOT</b> to activate your wallet and auto-claim.\n` +
+        `After opening the chat, tap the big <b>Start</b> button.`
     );
   }
 
@@ -831,7 +808,7 @@ bot.command("tip", async (ctx) => {
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, "✅ Tip placed. Posting…", 2500);
     deleteAfter(ctx);
-    const { queueReply } = await import("./tg.js");
+    const { queueReply } = await import("./tg.js"); // lazy
     // @ts-ignore
     queueReply(ctx, lines.join("\n"), extra);
   } else {
@@ -923,6 +900,7 @@ bot.command("withdraw", async (ctx) => {
   }
 
   const amtStr = formatLky(amount, 8);
+
   const ack = `Processing your withdrawal...\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nI'll DM you the result.`;
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, ack, 6000, { parse_mode: "Markdown" });
@@ -999,7 +977,7 @@ bot.command("withdraw", async (ctx) => {
 // ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
-// Event-loop lag monitor
+// Event-loop lag monitor: print in **ms** (convert from ns)
 const loopLag = monitorEventLoopDelay({ resolution: 20 });
 (loopLag as any).enable();
 (globalThis as any).__loopLag = loopLag;
@@ -1010,39 +988,29 @@ setInterval(() => {
   loopLag.reset();
 }, 10_000);
 
-// Launch
+// Launch (no top-level await!)
 const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
 const ALLOWED_UPDATES = (process.env.TG_ALLOWED_UPDATES ?? "message")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean) as any;
 
-// soft watchdog restart (don’t exit unless restart fails)
+// ---- polling watchdog: exit if no updates for too long ----
+let lastUpdateMs = Date.now();
+bot.use(async (ctx, next) => {
+  lastUpdateMs = Date.now();
+  return next();
+});
 const WATCHDOG_IDLE_SEC = Number(process.env.WATCHDOG_IDLE_SEC ?? "120");
-let restarting = false;
-async function restartPolling() {
-  if (restarting) return;
-  restarting = true;
-  try {
-    console.warn("[watchdog] idle detected — restarting polling");
-    await bot.stop("watchdog");
-    await bot.launch({
-      dropPendingUpdates: false,
-      allowedUpdates: ALLOWED_UPDATES,
-    });
-    lastUpdateMs = Date.now();
-    console.warn("[watchdog] polling restarted");
-  } catch (e: any) {
-    console.error("[watchdog] restart failed, exiting:", e?.message || e);
-    process.exit(86);
-  } finally {
-    restarting = false;
-  }
-}
 if (WATCHDOG_IDLE_SEC > 0) {
   setInterval(() => {
     const idleSec = Math.floor((Date.now() - lastUpdateMs) / 1000);
-    if (idleSec > WATCHDOG_IDLE_SEC) restartPolling();
+    if (idleSec > WATCHDOG_IDLE_SEC) {
+      console.error(
+        `[watchdog] no updates for ${idleSec}s — exiting for restart`
+      );
+      process.exit(86);
+    }
   }, 30_000);
 }
 
