@@ -6,13 +6,15 @@ import { rpc } from "./rpc.js";
 import { query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
-import { replyFast, queueReply } from "./tg.js";
+import { replyFast } from "./tg.js";
 
 // ---------- bot init ----------
-const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000");
+const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
-const bot = new Telegraf(botToken, { handlerTimeout: 7000 });
+
+// Be a little less strict than 7s in case PG/RPC hiccups briefly.
+const bot = new Telegraf(botToken, { handlerTimeout: 15000 });
 
 // --- measure inbound update latency (Telegram → your bot) ---
 bot.use(async (ctx, next) => {
@@ -27,22 +29,30 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ---- drop stale updates to prevent backlog ----
+// ---- stale updates: WARN by default; drop only if TG_DROP_STALE=true ----
 const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "20");
+const DROP_STALE = String(process.env.TG_DROP_STALE ?? "false") === "true";
 bot.use(async (ctx, next) => {
   const ts = (ctx.message?.date ??
     ctx.editedMessage?.date ??
     ctx.callbackQuery?.message?.date) as number | undefined;
+
   if (!ts) return next();
+
   const ageSec = Math.max(0, Math.round(Date.now() / 1000 - ts));
   if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
     const txt = (ctx.message as any)?.text || "";
-    console.warn(
-      `[tg] DROPPED stale update ${ageSec}s type=${ctx.updateType} ${
-        txt ? `"${txt.slice(0, 40)}"` : ""
-      }`
-    );
-    return;
+    const line = `[tg] ${
+      DROP_STALE ? "DROPPING" : "stale"
+    } update ${ageSec}s type=${ctx.updateType} ${
+      txt ? `"${txt.slice(0, 40)}"` : ""
+    }`;
+    if (DROP_STALE) {
+      console.warn(line);
+      return; // drop only if explicitly enabled
+    } else {
+      console.warn(line);
+    }
   }
   return next();
 });
@@ -52,7 +62,7 @@ const RESOLVE_USERNAME_TIMEOUT_MS = Number(
   process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
 );
 const USERNAME_CACHE_MS = Number(process.env.USERNAME_CACHE_MS ?? "1200000"); // 20 min
-const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000");
+const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
 const ENSURE_USER_CACHE_MS = Number(
   process.env.ENSURE_USER_CACHE_MS ?? "300000"
 ); // 5 min
@@ -90,7 +100,6 @@ async function ensureUserCached(tg: any) {
 const isGroup = (ctx: any) =>
   ctx.chat && (ctx.chat.type === "group" || ctx.chat.type === "supergroup");
 
-// basic timeout wrapper
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = setTimeout(() => reject(new Error("TIMEOUT")), ms);
@@ -107,7 +116,7 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-// ---- Telegram send gate (prevents bursts from piling up) ----
+// ---- Telegram send gate ----
 let tgInflight = 0;
 const tgWaiters: Array<() => void> = [];
 async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
@@ -123,7 +132,7 @@ async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-// safe wrappers for Telegram API calls (time-bounded)
+// safe wrappers
 async function safeReply(ctx: any, text: string, extra: any = {}) {
   return withTgGate(() => replyFast(ctx, text, extra, TG_API_TIMEOUT_MS));
 }
@@ -140,8 +149,8 @@ async function safeSend(
     )
   );
 }
-
 type SentMessage = { message_id: number };
+
 async function safeGetMe() {
   return withTimeout(bot.telegram.getMe(), TG_API_TIMEOUT_MS);
 }
@@ -166,10 +175,11 @@ const ephemeralReply = async (
 ) => {
   try {
     const m = (await safeReply(ctx, text, extra)) as SentMessage | undefined;
-    if (isGroup(ctx) && m?.message_id)
+    if (isGroup(ctx) && m?.message_id) {
       setTimeout(() => {
         ctx.deleteMessage(m.message_id!).catch(() => {});
       }, ms);
+    }
   } catch {}
 };
 
@@ -183,7 +193,6 @@ const dm = async (ctx: any, text: string, extra: any = {}) => {
   }
 };
 
-// background DM with flood-wait retry + logging
 async function dmLater(
   ctx: any,
   chatId: number,
@@ -238,12 +247,12 @@ async function botDeepLink(ctx?: any, payload = "") {
     : "";
 }
 
-// ---- HTML-safety ----
 const esc = (s: any) =>
   String(s ?? "").replace(
     /[&<>]/g,
     (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]!)
   );
+
 const startKb = (url?: string) =>
   url
     ? Markup.inlineKeyboard([[Markup.button.url("START LKY TIPBOT", url)]])
@@ -261,16 +270,12 @@ const isWalletBusy = (e: any) => {
     e?.code === -28
   );
 };
-async function rpcTry<T>(
-  method: string,
-  params: any[],
-  timeoutMs: number
-): Promise<{ ok: true; value: T } | { ok: false; err: RpcErr | any }> {
+async function rpcTry<T>(method: string, params: any[], timeoutMs: number) {
   try {
     const v = await rpc<T>(method, params, timeoutMs);
-    return { ok: true, value: v };
+    return { ok: true as const, value: v };
   } catch (e: any) {
-    return { ok: false, err: e };
+    return { ok: false as const, err: e };
   }
 }
 
@@ -290,7 +295,7 @@ async function withRpcGate<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-// ---------- one-time setup: schema + indexes ----------
+// ---------- one-time setup ----------
 async function ensureSetup() {
   await query(
     `ALTER TABLE public.users ADD COLUMN IF NOT EXISTS has_started boolean DEFAULT false NOT NULL;`
@@ -306,7 +311,7 @@ async function ensureSetup() {
   ).catch(() => {});
 }
 
-// ===== Small balance cache =====
+// ===== balance cache =====
 const balanceCache = new Map<number, { bal: bigint; ts: number }>();
 async function getBalanceCached(userId: number): Promise<bigint> {
   const hit = balanceCache.get(userId);
@@ -366,18 +371,21 @@ bot.command("health", async (ctx) => {
   } catch (e: any) {
     out.push(`DB: ERR ${e?.message || e}`);
   }
+
   try {
     const h = await rpc<number>("getblockcount", [], 3000);
     out.push(`RPC: ok (height ${h})`);
   } catch (e: any) {
     out.push(`RPC: ERR ${e?.message || e}`);
   }
+
   try {
     const me = await safeGetMe();
     out.push(`BOT: @${me?.username || "unknown"}`);
   } catch {
     out.push("BOT: getMe timeout");
   }
+
   await safeReply(ctx, out.join("\n"));
 });
 
@@ -387,17 +395,27 @@ bot.start(async (ctx) => {
   const newUname = ctx.from.username || null;
 
   const sql = `
-    WITH prev AS (SELECT id, has_started, username FROM public.users WHERE id = $1),
+    WITH prev AS (
+      SELECT id, has_started, username
+      FROM public.users
+      WHERE id = $1
+    ),
     upd AS (
       UPDATE public.users AS uu
-         SET has_started = TRUE, username = COALESCE($2, uu.username)
-        FROM prev
-       WHERE uu.id = prev.id
-         AND (prev.has_started IS DISTINCT FROM TRUE OR COALESCE($2, prev.username) IS DISTINCT FROM prev.username)
+      SET has_started = TRUE,
+          username    = COALESCE($2, uu.username)
+      FROM prev
+      WHERE uu.id = prev.id
+        AND (
+          prev.has_started IS DISTINCT FROM TRUE OR
+          COALESCE($2, prev.username) IS DISTINCT FROM prev.username
+        )
       RETURNING 1
     )
-    SELECT prev.has_started AS was_started, EXISTS(SELECT 1 FROM upd) AS changed
-      FROM prev LIMIT 1;
+    SELECT prev.has_started AS was_started,
+           EXISTS(SELECT 1 FROM upd) AS changed
+    FROM prev
+    LIMIT 1;
   `;
   const r = await query<{ was_started: boolean; changed: boolean }>(sql, [
     u.id,
@@ -471,6 +489,7 @@ type TgChatMinimal = { id?: number; username?: string };
 async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
   const uname = unameRaw.replace(/^@/, "");
   const key = uname.toLowerCase();
+
   const hit = unameCache.get(key);
   if (hit && Date.now() - hit.ts < USERNAME_CACHE_MS) return hit.id;
 
@@ -489,7 +508,9 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
       unameCache.set(key, { id, ts: Date.now() });
       return id;
     }
-  } catch {}
+  } catch {
+    /* timeout or error */
+  }
   return null;
 }
 
@@ -538,7 +559,7 @@ bot.command("deposit", async (ctx) => {
     );
     depositAddrCache.set(user.id, { addr, ts: Date.now() });
     await replyAddr(addr);
-    console.log("[/deposit] assigned]");
+    console.log("[/deposit] assigned");
   } catch (e: any) {
     console.error("[/deposit] ERR", e?.message || e);
     const mention = await botMention(ctx);
@@ -600,6 +621,7 @@ bot.command("tip", async (ctx) => {
   console.log("[/tip] start");
 
   const from = await ensureUserCached(ctx.from);
+
   const text = ctx.message?.text || "";
   const parts = text.trim().split(/\s+/);
   parts.shift();
@@ -745,7 +767,9 @@ bot.command("tip", async (ctx) => {
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, "✅ Tip placed. Posting…", 2500);
     deleteAfter(ctx);
-    queueReply(ctx, lines.join("\n"), extra); // static import avoids dynamic-import stalls
+    const { queueReply } = await import("./tg.js"); // lazy
+    // @ts-ignore
+    queueReply(ctx, lines.join("\n"), extra);
   } else {
     await safeReply(ctx, lines.join("\n"), extra);
   }
@@ -835,6 +859,7 @@ bot.command("withdraw", async (ctx) => {
   }
 
   const amtStr = formatLky(amount, 8);
+
   const ack = `Processing your withdrawal...\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nI'll DM you the result.`;
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, ack, 6000, { parse_mode: "Markdown" });
@@ -848,15 +873,18 @@ bot.command("withdraw", async (ctx) => {
       const v = await withRpcGate(() =>
         rpcTry<any>("validateaddress", [toAddress], 5000)
       );
-      if (v.ok && v.value && v.value.isvalid === false)
+      if (v.ok && v.value && v.value.isvalid === false) {
         return dmLater(ctx, ctx.from.id, "Invalid address.");
+      }
 
       const send = await withRpcGate(() =>
         rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
       );
+
       if (!send.ok) {
         const errStr = String(send.err?.message || send.err || "unknown error");
         console.error("[/withdraw bg] RPC ERR:", errStr);
+
         const msg = isWalletBusy(send.err)
           ? "Wallet is busy. Try /withdraw again in a minute."
           : /invalid|address/i.test(errStr)
@@ -864,14 +892,17 @@ bot.command("withdraw", async (ctx) => {
           : /insufficient|fund/i.test(errStr)
           ? "Node wallet has insufficient funds."
           : `Withdraw failed: ${errStr}`;
+
         return dmLater(ctx, ctx.from.id, msg);
       }
 
       const txid = send.value;
+
       try {
         await query(
           `INSERT INTO public.withdrawals (user_id, to_address, amount_lites, txid, status, created_at)
-           VALUES ($1,$2,$3,$4,'sent', NOW()) ON CONFLICT (txid) DO NOTHING`,
+           VALUES ($1,$2,$3,$4,'sent', NOW())
+           ON CONFLICT (txid) DO NOTHING`,
           [sender.id, toAddress, amount.toString(), txid]
         );
       } catch (e: any) {
@@ -905,7 +936,7 @@ bot.command("withdraw", async (ctx) => {
 // ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
-// Event-loop lag monitor: print in **ms** (convert from ns)
+// Event-loop lag monitor (ns → ms)
 const loopLag = monitorEventLoopDelay({ resolution: 20 });
 loopLag.enable();
 setInterval(() => {
@@ -917,9 +948,7 @@ setInterval(() => {
 
 // Launch (no top-level await!)
 const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
-const ALLOWED_UPDATES = (
-  process.env.TG_ALLOWED_UPDATES ?? "message,callback_query"
-)
+const ALLOWED_UPDATES = (process.env.TG_ALLOWED_UPDATES ?? "message")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean) as any;
@@ -931,23 +960,30 @@ bot.use(async (ctx, next) => {
   return next();
 });
 const WATCHDOG_IDLE_SEC = Number(process.env.WATCHDOG_IDLE_SEC ?? "120");
-setInterval(() => {
-  const idleSec = Math.floor((Date.now() - lastUpdateMs) / 1000);
-  if (idleSec > WATCHDOG_IDLE_SEC) {
-    console.error(
-      `[watchdog] no updates for ${idleSec}s — exiting for restart`
-    );
-    process.exit(86);
-  }
-}, 30_000);
+if (WATCHDOG_IDLE_SEC > 0) {
+  setInterval(() => {
+    const idleSec = Math.floor((Date.now() - lastUpdateMs) / 1000);
+    if (idleSec > WATCHDOG_IDLE_SEC) {
+      console.error(
+        `[watchdog] no updates for ${idleSec}s — exiting for restart`
+      );
+      process.exit(86);
+    }
+  }, 30_000);
+}
 
 async function start() {
   try {
+    console.log(
+      "[launch] deleting webhook (drop_pending_updates=%s)",
+      DROP_PENDING
+    );
     await bot.telegram.deleteWebhook({ drop_pending_updates: DROP_PENDING });
   } catch (e: any) {
     console.warn("[launch] deleteWebhook warn:", e?.message || e);
   }
 
+  console.log("[launch] starting long polling…");
   await bot.launch({
     dropPendingUpdates: DROP_PENDING,
     allowedUpdates: ALLOWED_UPDATES,
@@ -955,7 +991,7 @@ async function start() {
 
   await ensureSetup();
   await getBotUsernameEnsured();
-  console.log("Tipbot is running.");
+  console.log("[launch] Tipbot is running.");
 
   process.once("SIGINT", () => bot.stop("SIGINT"));
   process.once("SIGTERM", () => bot.stop("SIGTERM"));
