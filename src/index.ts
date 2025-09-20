@@ -7,17 +7,16 @@ import pool, { query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 import { replyFast } from "./tg.js";
-import { getQueueStats } from "./tg.js";
 
 // ---------- bot init ----------
-const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
+const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000");
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 
-// Be a little less strict than 7s in case PG/RPC hiccups briefly.
+// allow a bit more than 7s so tiny hiccups don't cancel handlers
 const bot = new Telegraf(botToken, { handlerTimeout: 15000 });
 
-// Minimal inbound visibility (off by default)
+// Optional: log inbound types (DEBUG_UPDATES=1)
 if (process.env.DEBUG_UPDATES === "1") {
   bot.use((ctx, next) => {
     console.log(
@@ -40,23 +39,18 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ---- drop stale updates (OFF by default) ----
-// Set TG_STALE_SEC>0 to enable. 0/empty disables.
+// ---- drop stale updates (OFF by default). Enable via TG_STALE_SEC>0 ----
 const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "0");
-
 bot.use(async (ctx, next) => {
   if (!STALE_UPDATE_MAX_AGE_SEC) return next(); // disabled
-
   const ts = (ctx.message?.date ??
     ctx.editedMessage?.date ??
     ctx.callbackQuery?.message?.date) as number | undefined;
-
-  if (!ts) return next(); // unknown timestamp → don't drop
-
+  if (!ts) return next();
   const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
   if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
     console.warn(`[tg] DROP update type=${ctx.updateType} age=${ageSec}s`);
-    return; // ignore only truly stale items
+    return;
   }
   return next();
 });
@@ -66,7 +60,7 @@ const RESOLVE_USERNAME_TIMEOUT_MS = Number(
   process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
 );
 const USERNAME_CACHE_MS = Number(process.env.USERNAME_CACHE_MS ?? "1200000"); // 20 min
-const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
+const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s
 const ENSURE_USER_CACHE_MS = Number(
   process.env.ENSURE_USER_CACHE_MS ?? "300000"
 ); // 5 min
@@ -127,10 +121,12 @@ async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
   if (tgInflight >= MAX_TG_INFLIGHT)
     await new Promise<void>((res) => tgWaiters.push(res));
   tgInflight++;
+  (globalThis as any).__tgInflight = tgInflight;
   try {
     return await fn();
   } finally {
     tgInflight--;
+    (globalThis as any).__tgInflight = tgInflight;
     const n = tgWaiters.shift();
     if (n) n();
   }
@@ -395,38 +391,30 @@ bot.command("health", async (ctx) => {
 
 // ---------- diag ----------
 bot.command("diag", async (ctx) => {
-  // event-loop p95 (ms) since last reset
   let p95ms = 0;
   try {
-    // @ts-ignore: loopLag is defined below the file; grab it via global
-    p95ms = Number(globalThis.__loopLag?.percentile?.(95) ?? 0) / 1e6;
+    p95ms = Number((globalThis as any).__loopLag?.percentile?.(95) ?? 0) / 1e6;
   } catch {}
-
-  // tg queue + inflight
   let tgQ = { size: 0, running: false };
   try {
-    // lazy import to avoid cycles
-    const { getQueueStats } = await import("./tg.js");
-    tgQ = getQueueStats();
+    // Lazy import — only if you added getQueueStats in ./tg.ts
+    const m: any = await import("./tg.js").catch(() => null);
+    if (m?.getQueueStats) tgQ = m.getQueueStats();
   } catch {}
-
+  const mu = process.memoryUsage();
   const lines = [
     `uptime: ${Math.floor(process.uptime())}s`,
     `eventLoop p95: ${p95ms.toFixed(2)}ms`,
-    `tgInflight: ${
-      typeof (globalThis as any).tgInflight === "number"
-        ? (globalThis as any).tgInflight
-        : "n/a"
-    }`,
+    `tgInflight: ${(globalThis as any).__tgInflight ?? "n/a"}`,
     `tgQueue: size=${tgQ.size} running=${tgQ.running}`,
     `pgPool: total=${(pool as any).totalCount} idle=${
       (pool as any).idleCount
     } waiting=${(pool as any).waitingCount}`,
-    `mem: rss=${(process.memoryUsage().rss / 1024 / 1024).toFixed(
-      1
-    )}MB heapUsed=${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(
-      1
-    )}MB`,
+    `mem: rss=${(mu.rss / 1024 / 1024).toFixed(1)}MB heapUsed=${(
+      mu.heapUsed /
+      1024 /
+      1024
+    ).toFixed(1)}MB`,
     `env: MAX_TG_INFLIGHT=${process.env.MAX_TG_INFLIGHT ?? "n/a"} PG_POOL_MAX=${
       process.env.PG_POOL_MAX ?? "n/a"
     }`,
@@ -812,7 +800,7 @@ bot.command("tip", async (ctx) => {
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, "✅ Tip placed. Posting…", 2500);
     deleteAfter(ctx);
-    const { queueReply } = await import("./tg.js"); // lazy
+    const { queueReply } = await import("./tg.js");
     // @ts-ignore
     queueReply(ctx, lines.join("\n"), extra);
   } else {
@@ -904,7 +892,6 @@ bot.command("withdraw", async (ctx) => {
   }
 
   const amtStr = formatLky(amount, 8);
-
   const ack = `Processing your withdrawal...\nAmount: ${amtStr} LKY\nAddress: \`${toAddress}\`\nI'll DM you the result.`;
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, ack, 6000, { parse_mode: "Markdown" });
@@ -925,11 +912,9 @@ bot.command("withdraw", async (ctx) => {
       const send = await withRpcGate(() =>
         rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
       );
-
       if (!send.ok) {
         const errStr = String(send.err?.message || send.err || "unknown error");
         console.error("[/withdraw bg] RPC ERR:", errStr);
-
         const msg = isWalletBusy(send.err)
           ? "Wallet is busy. Try /withdraw again in a minute."
           : /invalid|address/i.test(errStr)
@@ -937,7 +922,6 @@ bot.command("withdraw", async (ctx) => {
           : /insufficient|fund/i.test(errStr)
           ? "Node wallet has insufficient funds."
           : `Withdraw failed: ${errStr}`;
-
         return dmLater(ctx, ctx.from.id, msg);
       }
 
@@ -978,13 +962,12 @@ bot.command("withdraw", async (ctx) => {
   })();
 });
 
-// ---------- error & launch ----------
+// ---------- error & loop health ----------
 bot.catch((err) => console.error("Bot error", err));
 
-// Event-loop lag monitor: print in **ms** (convert from ns)
 const loopLag = monitorEventLoopDelay({ resolution: 20 });
 (loopLag as any).enable();
-(globalThis as any).__loopLag = loopLag; // <— add this line
+(globalThis as any).__loopLag = loopLag;
 setInterval(() => {
   const p95ms = Number(loopLag.percentile(95)) / 1e6;
   if (p95ms > 20)
@@ -992,19 +975,13 @@ setInterval(() => {
   loopLag.reset();
 }, 10_000);
 
-// Launch (no top-level await!)
-const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
-const ALLOWED_UPDATES = (process.env.TG_ALLOWED_UPDATES ?? "message")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean) as any;
-
 // ---- polling watchdog: exit if no updates for too long ----
 let lastUpdateMs = Date.now();
 bot.use(async (ctx, next) => {
   lastUpdateMs = Date.now();
   return next();
 });
+
 const WATCHDOG_IDLE_SEC = Number(process.env.WATCHDOG_IDLE_SEC ?? "120");
 if (WATCHDOG_IDLE_SEC > 0) {
   setInterval(() => {
@@ -1018,22 +995,67 @@ if (WATCHDOG_IDLE_SEC > 0) {
   }, 30_000);
 }
 
+// ---------- launch ----------
+const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
+
+// IMPORTANT: do NOT default to "message" — leave empty to receive ALL types.
+// Only pass allowedUpdates if you explicitly set env.
+const ALLOWED_UPDATES_RAW = (process.env.TG_ALLOWED_UPDATES ?? "").trim();
+const ALLOWED_UPDATES: any = ALLOWED_UPDATES_RAW
+  ? ALLOWED_UPDATES_RAW.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  : undefined;
+
+// Optional: poll debugger (DEBUG_POLL=1)
+if (process.env.DEBUG_POLL === "1") {
+  const orig = (bot.telegram as any).callApi.bind(bot.telegram);
+  (bot.telegram as any).callApi = async (
+    method: string,
+    data: any,
+    ...rest: any[]
+  ) => {
+    if (method === "getUpdates") {
+      const allowed = Array.isArray(data?.allowed_updates)
+        ? data.allowed_updates.join(",")
+        : "ALL";
+      console.log(
+        `[poll] getUpdates offset=${data?.offset ?? "-"} timeout=${
+          data?.timeout ?? "-"
+        } allowed=${allowed}`
+      );
+    }
+    try {
+      const res = await orig(method, data, ...rest);
+      if (method === "getUpdates") {
+        const n = Array.isArray(res) ? res.length : 0;
+        const next = n ? res[n - 1].update_id + 1 : "-";
+        console.log(`[poll] got=${n} nextOffset=${next}`);
+      }
+      return res;
+    } catch (e: any) {
+      if (method === "getUpdates")
+        console.error(`[poll] ERR ${e?.message || e}`);
+      throw e;
+    }
+  };
+}
+
 async function start() {
   try {
     console.log(
-      "[launch] deleting webhook (drop_pending_updates=%s)",
-      DROP_PENDING
+      `[launch] deleting webhook (drop_pending_updates=${DROP_PENDING})`
     );
     await bot.telegram.deleteWebhook({ drop_pending_updates: DROP_PENDING });
   } catch (e: any) {
     console.warn("[launch] deleteWebhook warn:", e?.message || e);
   }
 
+  const launchOpts: any = { dropPendingUpdates: DROP_PENDING };
+  if (ALLOWED_UPDATES) launchOpts.allowedUpdates = ALLOWED_UPDATES;
+
   console.log("[launch] starting long polling…");
-  await bot.launch({
-    dropPendingUpdates: DROP_PENDING,
-    allowedUpdates: ALLOWED_UPDATES,
-  });
+  await bot.launch(launchOpts);
 
   await ensureSetup();
   await getBotUsernameEnsured();
