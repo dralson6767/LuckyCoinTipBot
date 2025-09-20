@@ -17,6 +17,16 @@ if (!botToken) throw new Error("BOT_TOKEN is required");
 // Be a little less strict than 7s in case PG/RPC hiccups briefly.
 const bot = new Telegraf(botToken, { handlerTimeout: 15000 });
 
+// Minimal inbound visibility (off by default)
+if (process.env.DEBUG_UPDATES === "1") {
+  bot.use((ctx, next) => {
+    console.log(
+      `[tg] <- ${ctx.updateType} chat=${(ctx.chat as any)?.id ?? "?"}`
+    );
+    return next();
+  });
+}
+
 // --- measure inbound update latency (Telegram → your bot) ---
 bot.use(async (ctx, next) => {
   const ts = (ctx.message?.date ??
@@ -30,30 +40,23 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ---- stale updates: WARN by default; drop only if TG_DROP_STALE=true ----
-const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "20");
-const DROP_STALE = String(process.env.TG_DROP_STALE ?? "false") === "true";
+// ---- drop stale updates (OFF by default) ----
+// Set TG_STALE_SEC>0 to enable. 0/empty disables.
+const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "0");
+
 bot.use(async (ctx, next) => {
+  if (!STALE_UPDATE_MAX_AGE_SEC) return next(); // disabled
+
   const ts = (ctx.message?.date ??
     ctx.editedMessage?.date ??
     ctx.callbackQuery?.message?.date) as number | undefined;
 
-  if (!ts) return next();
+  if (!ts) return next(); // unknown timestamp → don't drop
 
-  const ageSec = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
   if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
-    const txt = (ctx.message as any)?.text || "";
-    const line = `[tg] ${
-      DROP_STALE ? "DROPPING" : "stale"
-    } update ${ageSec}s type=${ctx.updateType} ${
-      txt ? `"${txt.slice(0, 40)}"` : ""
-    }`;
-    if (DROP_STALE) {
-      console.warn(line);
-      return; // drop only if explicitly enabled
-    } else {
-      console.warn(line);
-    }
+    console.warn(`[tg] DROP update type=${ctx.updateType} age=${ageSec}s`);
+    return; // ignore only truly stale items
   }
   return next();
 });
