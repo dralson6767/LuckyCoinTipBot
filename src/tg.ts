@@ -16,7 +16,6 @@ export async function replyFast(
   timeoutMs = Number(process.env.TG_REPLY_TIMEOUT_MS ?? "5000")
 ) {
   try {
-    // @ts-ignore (Context.reply is Promise-like)
     return await Promise.race([
       ctx.reply(text, extra as any),
       timeout(timeoutMs),
@@ -32,15 +31,31 @@ export async function replyFast(
 
 /* -------------------- QUEUED SENDER -------------------- */
 /* Serializes sends and handles flood-wait (HTTP 429 retry_after). */
+/* Now with a hard timeout so a single stuck send can't freeze the queue. */
 
 type Job = () => Promise<void>;
 const queue: Job[] = [];
 let running = false;
 
 const SPACING_MS = Number(process.env.TG_SEND_SPACING_MS ?? "250"); // gap between sends
+const QUEUE_TIMEOUT_MS = Number(process.env.TG_QUEUE_TIMEOUT_MS ?? "8000"); // NEW
 
-function sleep(ms: number) {
+async function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+async function sendWithTimeout(
+  telegram: any,
+  chatId: number,
+  text: string,
+  extra?: any
+) {
+  return Promise.race([
+    telegram.sendMessage(chatId, text, extra),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("tg_queue_timeout")), QUEUE_TIMEOUT_MS)
+    ),
+  ]);
 }
 
 async function runQueue() {
@@ -59,7 +74,13 @@ async function runQueue() {
           queue.unshift(job);
           continue;
         }
-        console.warn("[tg] send error:", e?.message || e);
+        if (e?.message === "tg_queue_timeout") {
+          console.warn(
+            `[tg] queue send timed out after ${QUEUE_TIMEOUT_MS}ms; dropping`
+          );
+        } else {
+          console.warn("[tg] send error:", e?.message || e);
+        }
       }
       await sleep(SPACING_MS);
     }
@@ -75,7 +96,7 @@ export function queueSend(
   extra?: any
 ) {
   queue.push(async () => {
-    await telegram.sendMessage(chatId, text, extra);
+    await sendWithTimeout(telegram, chatId, text, extra);
   });
   void runQueue();
 }
@@ -85,4 +106,9 @@ export function queueReply(ctx: Context, text: string, extra?: any) {
   const chatId: number = (ctx.chat as any)?.id;
   // @ts-ignore
   queueSend((ctx as any).telegram, chatId, text, extra);
+}
+
+/** Minimal introspection so we can /diag on the bot */
+export function getQueueStats() {
+  return { size: queue.length, running };
 }

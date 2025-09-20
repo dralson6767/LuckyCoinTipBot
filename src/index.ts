@@ -7,6 +7,8 @@ import { query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 import { replyFast } from "./tg.js";
+import pool from "./db.js";
+import { getQueueStats } from "./tg.js";
 
 // ---------- bot init ----------
 const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
@@ -387,6 +389,27 @@ bot.command("health", async (ctx) => {
   }
 
   await safeReply(ctx, out.join("\n"));
+});
+
+// ---------- diag ----------
+bot.command("diag", async (ctx) => {
+  const { size, running } = getQueueStats();
+
+  // pg pool stats
+  const pg: any = pool as any;
+  const total = pg.totalCount ?? 0;
+  const idle = pg.idleCount ?? 0;
+  const waiting = pg.waitingCount ?? 0;
+
+  // internal gates (defined above in this file)
+  const lines = [
+    `rpcInflight=${rpcInflight}`,
+    `tgInflight=${tgInflight} waiters=${tgWaiters.length}`,
+    `queue size=${size} running=${running}`,
+    `pg total=${total} idle=${idle} waiting=${waiting}`,
+  ];
+
+  await safeReply(ctx, lines.join("\n"));
 });
 
 // ---------- commands ----------
