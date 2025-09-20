@@ -3,11 +3,10 @@ import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import { monitorEventLoopDelay } from "node:perf_hooks";
 import { rpc } from "./rpc.js";
-import { query, getBalanceLites } from "./db.js";
+import pool, { query, getBalanceLites } from "./db.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 import { replyFast } from "./tg.js";
-import pool from "./db.js";
 import { getQueueStats } from "./tg.js";
 
 // ---------- bot init ----------
@@ -393,22 +392,42 @@ bot.command("health", async (ctx) => {
 
 // ---------- diag ----------
 bot.command("diag", async (ctx) => {
-  const { size, running } = getQueueStats();
+  // event-loop p95 (ms) since last reset
+  let p95ms = 0;
+  try {
+    // @ts-ignore: loopLag is defined below the file; grab it via global
+    p95ms = Number(globalThis.__loopLag?.percentile?.(95) ?? 0) / 1e6;
+  } catch {}
 
-  // pg pool stats
-  const pg: any = pool as any;
-  const total = pg.totalCount ?? 0;
-  const idle = pg.idleCount ?? 0;
-  const waiting = pg.waitingCount ?? 0;
+  // tg queue + inflight
+  let tgQ = { size: 0, running: false };
+  try {
+    // lazy import to avoid cycles
+    const { getQueueStats } = await import("./tg.js");
+    tgQ = getQueueStats();
+  } catch {}
 
-  // internal gates (defined above in this file)
   const lines = [
-    `rpcInflight=${rpcInflight}`,
-    `tgInflight=${tgInflight} waiters=${tgWaiters.length}`,
-    `queue size=${size} running=${running}`,
-    `pg total=${total} idle=${idle} waiting=${waiting}`,
+    `uptime: ${Math.floor(process.uptime())}s`,
+    `eventLoop p95: ${p95ms.toFixed(2)}ms`,
+    `tgInflight: ${
+      typeof (globalThis as any).tgInflight === "number"
+        ? (globalThis as any).tgInflight
+        : "n/a"
+    }`,
+    `tgQueue: size=${tgQ.size} running=${tgQ.running}`,
+    `pgPool: total=${(pool as any).totalCount} idle=${
+      (pool as any).idleCount
+    } waiting=${(pool as any).waitingCount}`,
+    `mem: rss=${(process.memoryUsage().rss / 1024 / 1024).toFixed(
+      1
+    )}MB heapUsed=${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(
+      1
+    )}MB`,
+    `env: MAX_TG_INFLIGHT=${process.env.MAX_TG_INFLIGHT ?? "n/a"} PG_POOL_MAX=${
+      process.env.PG_POOL_MAX ?? "n/a"
+    }`,
   ];
-
   await safeReply(ctx, lines.join("\n"));
 });
 
@@ -959,9 +978,10 @@ bot.command("withdraw", async (ctx) => {
 // ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
-// Event-loop lag monitor (ns → ms)
+// Event-loop lag monitor: print in **ms** (convert from ns)
 const loopLag = monitorEventLoopDelay({ resolution: 20 });
-loopLag.enable();
+(loopLag as any).enable();
+(globalThis as any).__loopLag = loopLag; // <— add this line
 setInterval(() => {
   const p95ms = Number(loopLag.percentile(95)) / 1e6;
   if (p95ms > 20)
