@@ -13,7 +13,7 @@ const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000");
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 
-// allow a bit more than 7s so tiny hiccups don't cancel handlers
+// Be lenient with handler time to avoid internal timeouts on hiccups.
 const bot = new Telegraf(botToken, { handlerTimeout: 15000 });
 
 // Optional: log inbound types (DEBUG_UPDATES=1)
@@ -397,7 +397,6 @@ bot.command("diag", async (ctx) => {
   } catch {}
   let tgQ = { size: 0, running: false };
   try {
-    // Lazy import — only if you added getQueueStats in ./tg.ts
     const m: any = await import("./tg.js").catch(() => null);
     if (m?.getQueueStats) tgQ = m.getQueueStats();
   } catch {}
@@ -981,7 +980,6 @@ bot.use(async (ctx, next) => {
   lastUpdateMs = Date.now();
   return next();
 });
-
 const WATCHDOG_IDLE_SEC = Number(process.env.WATCHDOG_IDLE_SEC ?? "120");
 if (WATCHDOG_IDLE_SEC > 0) {
   setInterval(() => {
@@ -998,16 +996,14 @@ if (WATCHDOG_IDLE_SEC > 0) {
 // ---------- launch ----------
 const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
 
-// IMPORTANT: do NOT default to "message" — leave empty to receive ALL types.
-// Only pass allowedUpdates if you explicitly set env.
-const ALLOWED_UPDATES_RAW = (process.env.TG_ALLOWED_UPDATES ?? "").trim();
-const ALLOWED_UPDATES: any = ALLOWED_UPDATES_RAW
-  ? ALLOWED_UPDATES_RAW.split(",")
-      .map((s) => s.trim())
-      .filter(Boolean)
-  : undefined;
+// Do NOT pass allowedUpdates at all (avoids queue-head blocks).
+if ((process.env.TG_ALLOWED_UPDATES ?? "").trim()) {
+  console.warn(
+    "[launch] Ignoring TG_ALLOWED_UPDATES to avoid long-poll blocking."
+  );
+}
 
-// Optional: poll debugger (DEBUG_POLL=1)
+// Optional: poll debugger (enable with DEBUG_POLL=1)
 if (process.env.DEBUG_POLL === "1") {
   const orig = (bot.telegram as any).callApi.bind(bot.telegram);
   (bot.telegram as any).callApi = async (
@@ -1051,11 +1047,8 @@ async function start() {
     console.warn("[launch] deleteWebhook warn:", e?.message || e);
   }
 
-  const launchOpts: any = { dropPendingUpdates: DROP_PENDING };
-  if (ALLOWED_UPDATES) launchOpts.allowedUpdates = ALLOWED_UPDATES;
-
-  console.log("[launch] starting long polling…");
-  await bot.launch(launchOpts);
+  console.log("[launch] starting long polling with allowedUpdates=ALL");
+  await bot.launch({ dropPendingUpdates: DROP_PENDING }); // ← no allowedUpdates
 
   await ensureSetup();
   await getBotUsernameEnsured();
