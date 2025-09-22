@@ -168,9 +168,30 @@ async function safeGetChat(ctx: any, uname: string) {
   );
 }
 
+// Robust delete with optional delay + flood-wait retry
+async function deleteLater(ctx: any, messageId?: number, delayMs = 0) {
+  setTimeout(async () => {
+    try {
+      await withTgGate(() =>
+        withTimeout(ctx.deleteMessage(messageId as any), TG_API_TIMEOUT_MS)
+      );
+    } catch (e: any) {
+      const retry = (e as any)?.parameters?.retry_after;
+      if (retry) {
+        console.warn("[deleteLater] flood-wait", retry, "s; msg", messageId);
+        setTimeout(() => {
+          ctx.deleteMessage(messageId as any).catch(() => {});
+        }, (retry + 1) * 1000);
+      } else {
+        // swallow other delete errors (already deleted / missing perms etc.)
+      }
+    }
+  }, Math.max(0, delayMs));
+}
+
 const deleteAfter = (ctx: any) => {
   try {
-    if (isGroup(ctx) && ctx.message) ctx.deleteMessage().catch(() => {});
+    if (isGroup(ctx) && ctx.message) deleteLater(ctx); // deletes the user's /tip command
   } catch {}
 };
 
@@ -182,11 +203,7 @@ const ephemeralReply = async (
 ) => {
   try {
     const m = (await safeReply(ctx, text, extra)) as SentMessage | undefined;
-    if (isGroup(ctx) && m?.message_id) {
-      setTimeout(() => {
-        ctx.deleteMessage(m.message_id!).catch(() => {});
-      }, ms);
-    }
+    if (isGroup(ctx) && m?.message_id) deleteLater(ctx, m.message_id, ms);
   } catch {}
 };
 
