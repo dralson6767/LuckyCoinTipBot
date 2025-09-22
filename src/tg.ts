@@ -110,5 +110,5 @@ export function queueReply(ctx: Context, text: string, extra?: any) {
 
 /** Minimal introspection so we can /diag on the bot */
 export function getQueueStats() {
-  return { size: queue.length, running };
+  return { size: (queue as any).length ?? 0, running };
 }

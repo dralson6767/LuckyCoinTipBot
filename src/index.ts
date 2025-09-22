@@ -2,31 +2,30 @@
 import "dotenv/config";
 import { Telegraf, Markup } from "telegraf";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { rpc } from "./rpc.js";
 import pool, { query, getBalanceLites } from "./db.js";
+import { rpc } from "./rpc.js";
 import { ensureUser, transfer, findUserByUsername, debit } from "./ledger.js";
 import { parseLkyToLites, formatLky, isValidTipAmount } from "./util.js";
 import { replyFast } from "./tg.js";
 
 // ---------- bot init ----------
-const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // hard cap per Telegram call
+const TG_API_TIMEOUT_MS = Number(process.env.TG_API_TIMEOUT_MS ?? "5000"); // per Telegram call hard cap
 const botToken = process.env.BOT_TOKEN;
 if (!botToken) throw new Error("BOT_TOKEN is required");
 
-// Slightly looser than 7s to avoid handler timeouts on brief hiccups.
+// Be a bit lenient vs PG/RPC hiccups
 const bot = new Telegraf(botToken, { handlerTimeout: 15000 });
 
-// Optional minimal visibility
+// Minimal inbound visibility toggle
 if (process.env.DEBUG_UPDATES === "1") {
   bot.use((ctx, next) => {
-    console.log(
-      `[tg] <- ${ctx.updateType} chat=${(ctx.chat as any)?.id ?? "?"}`
-    );
+    // @ts-ignore
+    console.log(`[tg] <- ${ctx.updateType} chat=${ctx.chat?.id ?? "?"}`);
     return next();
   });
 }
 
-// --- inbound update latency (Telegram → your bot) ---
+// --- measure inbound update latency (Telegram → your bot) ---
 bot.use(async (ctx, next) => {
   const ts = (ctx.message?.date ??
     ctx.editedMessage?.date ??
@@ -39,17 +38,22 @@ bot.use(async (ctx, next) => {
   return next();
 });
 
-// ---- drop stale updates (OFF by default; enable with TG_STALE_SEC>0) ----
+// ---- optional stale drop (OFF unless TG_STALE_SEC>0) ----
 const STALE_UPDATE_MAX_AGE_SEC = Number(process.env.TG_STALE_SEC ?? "0");
 bot.use(async (ctx, next) => {
-  if (!STALE_UPDATE_MAX_AGE_SEC) return next();
+  if (!STALE_UPDATE_MAX_AGE_SEC) return next(); // disabled
   const ts = (ctx.message?.date ??
     ctx.editedMessage?.date ??
     ctx.callbackQuery?.message?.date) as number | undefined;
   if (!ts) return next();
   const ageSec = Math.max(0, Math.floor(Date.now() / 1000 - ts));
   if (ageSec > STALE_UPDATE_MAX_AGE_SEC) {
-    console.warn(`[tg] DROP update type=${ctx.updateType} age=${ageSec}s`);
+    const txt = (ctx.message as any)?.text || "";
+    console.warn(
+      `[tg] DROP stale type=${ctx.updateType} age=${ageSec}s ${
+        txt ? `"${txt.slice(0, 40)}"` : ""
+      }`
+    );
     return;
   }
   return next();
@@ -60,7 +64,7 @@ const RESOLVE_USERNAME_TIMEOUT_MS = Number(
   process.env.RESOLVE_USERNAME_TIMEOUT_MS ?? "1500"
 );
 const USERNAME_CACHE_MS = Number(process.env.USERNAME_CACHE_MS ?? "1200000"); // 20 min
-const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s default
+const BAL_CACHE_MS = Number(process.env.BALANCE_CACHE_MS ?? "5000"); // 5s
 const ENSURE_USER_CACHE_MS = Number(
   process.env.ENSURE_USER_CACHE_MS ?? "300000"
 ); // 5 min
@@ -68,23 +72,19 @@ const MAX_RPC_INFLIGHT = Number(process.env.MAX_RPC_INFLIGHT ?? "4");
 const MAX_TG_INFLIGHT = Number(process.env.MAX_TG_INFLIGHT ?? "8");
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 
-// ---------- hot-path caches ----------
+// tiny cache for @username → tg id
 type CacheHit = { id: number; ts: number };
-
-// @username -> tg id memo (resolved from DB or getChat)
 const unameCache = new Map<string, CacheHit>();
 
-// cache for ensureUser (avoid hammering DB every message)
+// --- ensureUser (hot-path) cache ---
 const ensureUserCache = new Map<
   number,
   { id: number; uname?: string; ts: number }
 >();
-async function ensureUserCached(tg: { id?: number; username?: string | null }) {
+async function ensureUserCached(tg: any) {
   const id = Number(tg?.id);
-  if (!id) throw new Error("Bad tg user id");
-  const uname = (tg?.username ?? undefined) as string | undefined;
+  const uname = tg?.username || undefined;
   const now = Date.now();
-
   const hit = ensureUserCache.get(id);
   if (
     hit &&
@@ -93,8 +93,7 @@ async function ensureUserCached(tg: { id?: number; username?: string | null }) {
   ) {
     return { id: hit.id };
   }
-
-  const u = await ensureUser({ id, username: uname ?? null } as any);
+  const u = await ensureUser(tg);
   ensureUserCache.set(id, { id: u.id, uname, ts: now });
   return u;
 }
@@ -126,12 +125,10 @@ async function withTgGate<T>(fn: () => Promise<T>): Promise<T> {
   if (tgInflight >= MAX_TG_INFLIGHT)
     await new Promise<void>((res) => tgWaiters.push(res));
   tgInflight++;
-  (globalThis as any).tgInflight = tgInflight;
   try {
     return await fn();
   } finally {
     tgInflight--;
-    (globalThis as any).tgInflight = tgInflight;
     const n = tgWaiters.shift();
     if (n) n();
   }
@@ -316,6 +313,40 @@ async function ensureSetup() {
   ).catch(() => {});
 }
 
+// ---------- singleton guard (prevents 2nd instance) ----------
+async function assertSingleton() {
+  // Use a fixed advisory lock key for the "bot" singleton
+  const KEY = 814023777; // any 32-bit int; keep stable
+  try {
+    const r = await query<{ ok: boolean }>(
+      `SELECT pg_try_advisory_lock($1) AS ok`,
+      [KEY]
+    );
+    if (!r.rows[0]?.ok) {
+      console.error(
+        "[single] another bot process already holds the lock — exiting."
+      );
+      process.exit(44);
+    }
+    // Best-effort unlock on shutdown
+    const unlock = () => {
+      query(`SELECT pg_advisory_unlock($1)`, [KEY]).catch(() => {});
+    };
+    process.on("exit", unlock);
+    process.on("SIGINT", () => {
+      unlock();
+      process.exit(0);
+    });
+    process.on("SIGTERM", () => {
+      unlock();
+      process.exit(0);
+    });
+  } catch (e: any) {
+    // If DB is down, don't block startup — just log. (won't prevent duplicates in that edge case)
+    console.warn("[single] advisory lock not acquired:", e?.message || e);
+  }
+}
+
 // ===== balance cache =====
 const balanceCache = new Map<number, { bal: bigint; ts: number }>();
 async function getBalanceCached(userId: number): Promise<bigint> {
@@ -396,36 +427,23 @@ bot.command("health", async (ctx) => {
 
 // ---------- diag ----------
 bot.command("diag", async (ctx) => {
-  // event-loop p95 (ms) since last reset
   let p95ms = 0;
   try {
     p95ms = Number((globalThis as any).__loopLag?.percentile?.(95) ?? 0) / 1e6;
   } catch {}
+  let total = (pool as any).totalCount ?? "?";
+  let idle = (pool as any).idleCount ?? "?";
+  let waiting = (pool as any).waitingCount ?? "?";
 
-  // tg queued sender stats (optional)
-  let tgQ = { size: 0, running: false };
-  try {
-    const { getQueueStats } = await import("./tg.js"); // lazy
-    tgQ = typeof getQueueStats === "function" ? getQueueStats() : tgQ;
-  } catch {}
-
-  const m = process.memoryUsage();
   const lines = [
     `uptime: ${Math.floor(process.uptime())}s`,
     `eventLoop p95: ${p95ms.toFixed(2)}ms`,
-    `tgInflight: ${(globalThis as any).tgInflight ?? "n/a"}`,
-    `tgQueue: size=${tgQ.size} running=${tgQ.running}`,
-    `pgPool: total=${(pool as any).totalCount} idle=${
-      (pool as any).idleCount
-    } waiting=${(pool as any).waitingCount}`,
-    `mem: rss=${(m.rss / 1024 / 1024).toFixed(1)}MB heapUsed=${(
-      m.heapUsed /
-      1024 /
-      1024
-    ).toFixed(1)}MB`,
-    `env: MAX_TG_INFLIGHT=${process.env.MAX_TG_INFLIGHT ?? "n/a"} PG_POOL_MAX=${
-      process.env.PG_POOL_MAX ?? "n/a"
-    }`,
+    `pgPool: total=${total} idle=${idle} waiting=${waiting}`,
+    `mem: rss=${(process.memoryUsage().rss / 1024 / 1024).toFixed(
+      1
+    )}MB heapUsed=${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(
+      1
+    )}MB`,
   ];
   await safeReply(ctx, lines.join("\n"));
 });
@@ -550,7 +568,7 @@ async function resolveUserIdByUsername(ctx: any, unameRaw: string) {
       return id;
     }
   } catch {
-    /* timeout or error */
+    /* ignore */
   }
   return null;
 }
@@ -808,7 +826,7 @@ bot.command("tip", async (ctx) => {
   if (isGroup(ctx)) {
     await ephemeralReply(ctx, "✅ Tip placed. Posting…", 2500);
     deleteAfter(ctx);
-    const { queueReply } = await import("./tg.js"); // lazy
+    const { queueReply } = await import("./tg.js"); // lazy import
     // @ts-ignore
     queueReply(ctx, lines.join("\n"), extra);
   } else {
@@ -921,11 +939,9 @@ bot.command("withdraw", async (ctx) => {
       const send = await withRpcGate(() =>
         rpcTry<string>("sendtoaddress", [toAddress, Number(amtStr)], 15000)
       );
-
       if (!send.ok) {
         const errStr = String(send.err?.message || send.err || "unknown error");
         console.error("[/withdraw bg] RPC ERR:", errStr);
-
         const msg = isWalletBusy(send.err)
           ? "Wallet is busy. Try /withdraw again in a minute."
           : /invalid|address/i.test(errStr)
@@ -933,7 +949,6 @@ bot.command("withdraw", async (ctx) => {
           : /insufficient|fund/i.test(errStr)
           ? "Node wallet has insufficient funds."
           : `Withdraw failed: ${errStr}`;
-
         return dmLater(ctx, ctx.from.id, msg);
       }
 
@@ -977,7 +992,7 @@ bot.command("withdraw", async (ctx) => {
 // ---------- error & launch ----------
 bot.catch((err) => console.error("Bot error", err));
 
-// Event-loop lag monitor: print in **ms** (convert from ns)
+// Event-loop lag monitor
 const loopLag = monitorEventLoopDelay({ resolution: 20 });
 (loopLag as any).enable();
 (globalThis as any).__loopLag = loopLag;
@@ -988,14 +1003,14 @@ setInterval(() => {
   loopLag.reset();
 }, 10_000);
 
-// Launch (no top-level await!)
+// Launch
 const DROP_PENDING = String(process.env.TG_DROP_PENDING ?? "true") === "true";
 const ALLOWED_UPDATES = (process.env.TG_ALLOWED_UPDATES ?? "message")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean) as any;
 
-// ---- polling watchdog: exit if no updates for too long ----
+// ---- polling watchdog (disable by setting WATCHDOG_IDLE_SEC=0) ----
 let lastUpdateMs = Date.now();
 bot.use(async (ctx, next) => {
   lastUpdateMs = Date.now();
@@ -1016,6 +1031,7 @@ if (WATCHDOG_IDLE_SEC > 0) {
 
 async function start() {
   try {
+    await assertSingleton(); // <— prevent 2nd instance right at startup
     console.log(
       "[launch] deleting webhook (drop_pending_updates=%s)",
       DROP_PENDING
