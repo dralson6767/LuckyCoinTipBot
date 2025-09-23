@@ -886,6 +886,53 @@ bot.command("withdraw", async (ctx) => {
     return;
   }
 
+  // --- block withdrawing to your own deposit address ---
+  try {
+    // 1) Quick DB check against the saved deposit address (no new addr allocation)
+    const selfDep = await query<{ deposit_address: string | null }>(
+      "SELECT deposit_address FROM public.users WHERE id = $1",
+      [sender.id]
+    );
+    let isSelf = selfDep.rows[0]?.deposit_address
+      ? selfDep.rows[0]!.deposit_address === toAddress
+      : false;
+
+    // 2) Extra safety: if not matched in DB, ask the node if this address is ours
+    //    AND labeled with this user's Telegram ID (same label you use for deposits).
+    if (!isSelf) {
+      const info = await withRpcGate(() =>
+        rpcTry<any>("getaddressinfo", [toAddress], 4000)
+      );
+      if (info.ok && info.value) {
+        const isMine = info.value.ismine === true;
+        // Bitcoin Core style: either "label" or "labels:[{name}]"
+        const label =
+          info.value.label ??
+          (Array.isArray(info.value.labels)
+            ? info.value.labels[0]?.name
+            : undefined);
+        if (isMine && String(label ?? "") === String(ctx.from.id)) {
+          isSelf = true;
+        }
+      }
+    }
+
+    if (isSelf) {
+      const msg =
+        "That's your own deposit address. Use /tip to move funds internally, or withdraw to an external wallet.";
+      if (isGroup(ctx)) {
+        const ok = await dm(ctx, msg);
+        if (!ok) await ephemeralReply(ctx, msg, 6000);
+        deleteAfter(ctx);
+      } else {
+        await safeReply(ctx, msg);
+      }
+      return; // stop the withdraw
+    }
+  } catch {
+    // If this check hiccups, fail open (we only block on confirmed self-address).
+  }
+
   const bal = await getBalanceCached(sender.id);
   if (bal < amount) {
     const msg = `Insufficient balance. You have ${formatLky(
