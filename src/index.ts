@@ -77,6 +77,20 @@ const MAX_RPC_INFLIGHT = Number(process.env.MAX_RPC_INFLIGHT ?? "4");
 const MAX_TG_INFLIGHT = Number(process.env.MAX_TG_INFLIGHT ?? "8");
 const decimals = Number(process.env.DEFAULT_DISPLAY_DECIMALS ?? "8");
 
+// --- ATH $ calc (exact with BigInt; rounds to nearest cent) ---
+const LITES_PER_LKY = 100_000_000n;
+const ATH_USD_CENTS_PER_LKY = 1700n; // $17.00
+
+function usdAtAthFromLites(lites: bigint): string {
+  const cents =
+    (lites * ATH_USD_CENTS_PER_LKY + LITES_PER_LKY / 2n) / LITES_PER_LKY; // round
+  const sign = cents < 0n ? "-" : "";
+  const abs = cents < 0n ? -cents : cents;
+  const dollars = abs / 100n;
+  const rem = abs % 100n;
+  return `${sign}$${dollars.toString()}.${rem.toString().padStart(2, "0")}`;
+}
+
 // tiny cache for @username → tg id
 type CacheHit = { id: number; ts: number };
 const unameCache = new Map<string, CacheHit>();
@@ -631,8 +645,14 @@ bot.command("balance", async (ctx) => {
   console.log("[/balance] start", ctx.from?.id, ctx.chat?.id);
   try {
     const user = await ensureUserCached(ctx.from);
-    const bal = await getBalanceCached(user.id);
-    const text = `Balance: ${formatLky(bal, decimals)} LKY`;
+    const bal = await getBalanceCached(user.id); // bigint (lites)
+    const lky = formatLky(bal, decimals); // e.g. "5.00000000"
+    const usd = usdAtAthFromLites(bal); // e.g. "$85.00"
+
+    const text =
+      `You’ve got 🍀 ${lky} LKY in your wallet!\n` +
+      `That’s ${usd} at LuckyCoin’s ATH 🚀`;
+
     if (isGroup(ctx)) {
       const ok = await dm(ctx, text);
       if (!ok) {
